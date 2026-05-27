@@ -1,0 +1,30 @@
+{
+  "name": "paperclip-battler",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build && npm run mcp:build",
+    "preview": "vite preview --host 127.0.0.1",
+    "mcp:build": "tsc -p tsconfig.mcp.json",
+    "mcp:dev": "tsx mcp/server.ts",
+    "mcp:start": "node dist-mcp/mcp/server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.13.3",
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vite": "^4.5.5"
+  }
+}

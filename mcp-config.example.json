@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "paperclip-battler": {
+      "command": "node",
+      "args": ["F:\\Projects\\paperclip-battler\\dist-mcp\\mcp\\server.js"],
+      "env": {
+        "PAPERCLIP_BRIDGE_PORT": "8787",
+        "PAPERCLIP_STATE_PATH": "F:\\Projects\\paperclip-battler\\.paperclip-agent-state.json"
+      }
+    }
+  }
+}

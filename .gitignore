@@ -1,0 +1,7 @@
+node_modules/
+dist/
+dist-mcp/
+.env
+.paperclip-agent-state.json
+.DS_Store
+*.log
