@@ -25,6 +25,9 @@ const CODEX_INSTRUCTION_PATHS = [
   join(SERVER_DIR, "..", "docs", "codex-agent-ai-instructions.md"),
   join(SERVER_DIR, "..", "..", "docs", "codex-agent-ai-instructions.md")
 ].filter(Boolean) as string[];
+const INSTRUCTION_MODES = ["none", "paul", "codex"] as const;
+
+type InstructionMode = (typeof INSTRUCTION_MODES)[number];
 
 type AgentButton = {
   id: string;
@@ -97,6 +100,7 @@ type AgentCommandResult = {
 
 let latestReport: AgentReport | null = null;
 let pendingCommand: AgentCommand | null = null;
+let instructionMode: InstructionMode = "none";
 const commandWaiters = new Map<string, (result: AgentCommandResult) => void>();
 const commandResults = new Map<string, AgentCommandResult>();
 
@@ -129,7 +133,7 @@ mcpServer.registerResource(
   "paperclip://agent/pauls-ai-instructions",
   {
     title: "Paul's Agent AI Instructions",
-    description: "Standing playbook to consult before playing Paperclip Battler for Paul.",
+    description: "Optional Paul-flavored playbook for Paperclip Battler agent play.",
     mimeType: "text/markdown"
   },
   async (uri) => ({
@@ -147,17 +151,20 @@ mcpServer.registerTool(
   "pauls_agent_ai_instructions",
   {
     title: "Paul's Agent AI Instructions",
-    description: "Read Paul's standing instructions before playing the Agent side of Paperclip Battler.",
+    description: "Optionally read Paul's instructions for the Agent side of Paperclip Battler.",
     inputSchema: {}
   },
-  async () => ({
-    content: [
-      {
-        type: "text" as const,
-        text: getPaulsAgentInstructions()
-      }
-    ]
-  })
+  async () => {
+    instructionMode = "paul";
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: getPaulsAgentInstructions()
+        }
+      ]
+    };
+  }
 );
 
 mcpServer.registerResource(
@@ -183,17 +190,35 @@ mcpServer.registerTool(
   "codex_agent_ai_instructions",
   {
     title: "Codex Agent AI Instructions",
-    description: "Read Codex's self-maintained operating notes before playing or improving the agent side.",
+    description: "Optionally read Codex's self-maintained operating notes for playing or improving the agent side.",
     inputSchema: {}
   },
-  async () => ({
-    content: [
-      {
-        type: "text" as const,
-        text: getCodexAgentInstructions()
-      }
-    ]
-  })
+  async () => {
+    instructionMode = "codex";
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: getCodexAgentInstructions()
+        }
+      ]
+    };
+  }
+);
+
+mcpServer.registerTool(
+  "set_agent_instruction_mode",
+  {
+    title: "Set Agent Instruction Mode",
+    description: "Set which optional instruction playbook is currently being used: none, Paul, or Codex.",
+    inputSchema: {
+      mode: z.enum(INSTRUCTION_MODES).describe("Instruction mode to show in the UI.")
+    }
+  },
+  async ({ mode }) => {
+    instructionMode = mode;
+    return textJson({ ok: true, instructionMode, instructionLabel: instructionModeLabel(instructionMode) });
+  }
 );
 
 mcpServer.registerTool(
@@ -331,6 +356,18 @@ function startBridge() {
         return;
       }
 
+      if (request.method === "GET" && url.pathname === "/instructions/mode") {
+        sendJson(response, 200, { ok: true, instructionMode, instructionLabel: instructionModeLabel(instructionMode) });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/instructions/mode") {
+        const body = await readJsonBody<{ mode?: string }>(request);
+        instructionMode = normalizeInstructionMode(body.mode);
+        sendJson(response, 200, { ok: true, instructionMode, instructionLabel: instructionModeLabel(instructionMode) });
+        return;
+      }
+
       if (request.method === "POST" && url.pathname === "/command/click") {
         const body = await readJsonBody<{ buttonId?: string; index?: number; text?: string }>(request);
         const button = resolveButton(body);
@@ -463,6 +500,8 @@ function getBridgeState() {
     ok: true,
     bridgeUrl: `http://127.0.0.1:${BRIDGE_PORT}`,
     agentUrl: `http://127.0.0.1:${BRIDGE_PORT}/agent/${ORIGINAL_ENTRY}`,
+    instructionMode,
+    instructionLabel: instructionModeLabel(instructionMode),
     agentConnected,
     lastReportAt: latestReport?.at ?? null,
     buttonCount: latestReport?.buttons.filter((button) => button.visible).length ?? 0,
@@ -666,6 +705,18 @@ function inferContentType(path: string) {
   return "application/octet-stream";
 }
 
+function normalizeInstructionMode(value: unknown): InstructionMode {
+  return typeof value === "string" && INSTRUCTION_MODES.includes(value as InstructionMode)
+    ? (value as InstructionMode)
+    : "none";
+}
+
+function instructionModeLabel(mode: InstructionMode) {
+  if (mode === "paul") return "Paul";
+  if (mode === "codex") return "Codex";
+  return "None";
+}
+
 function getPaulsAgentInstructions() {
   return readInstructionFile(PAULS_INSTRUCTION_PATHS, [
     "# Paul's Agent AI Instructions",
@@ -679,8 +730,8 @@ function getCodexAgentInstructions() {
   return readInstructionFile(CODEX_INSTRUCTION_PATHS, [
     "# Codex Agent AI Instructions",
     "",
-    "Call Paul's instructions first, then use these self-notes. Observe the live agent state, act in short",
-    "verified bursts, improve the bridge when controls are missing, and update the playbook when tactics change."
+    "Use this optional self-playbook when it helps. Observe the live agent state, act in short verified",
+    "bursts, improve the bridge when controls are missing, and update the playbook when tactics change."
   ]);
 }
 

@@ -35,6 +35,7 @@ Available MCP tools:
 
 - `pauls_agent_ai_instructions`
 - `codex_agent_ai_instructions`
+- `set_agent_instruction_mode`
 - `get_agent_page_state`
 - `list_agent_buttons`
 - `click_agent_button`
@@ -42,12 +43,13 @@ Available MCP tools:
 - `set_agent_control`
 - `reset_agent_page`
 
-Paul's standing playbook lives at `docs/pauls-agent-ai-instructions.md`; Codex's self-maintained operating notes live at `docs/codex-agent-ai-instructions.md`. The MCP tools read those files so they can be edited directly.
+Paul's optional playbook lives at `docs/pauls-agent-ai-instructions.md`; Codex's optional self-maintained operating notes live at `docs/codex-agent-ai-instructions.md`. The MCP tools read those files so they can be edited directly. The app header shows the current instruction mode: `None`, `Paul`, or `Codex`.
 
 For local development and chat-driven play, the bridge also exposes:
 
 - `POST /command/click` with `{ "buttonId": "btnMakePaperclip" }`
 - `POST /command/set-control` with `{ "controlId": "stratPicker", "value": "0" }`
+- `POST /instructions/mode` with `{ "mode": "codex" }`
 
 An example client config is included at `mcp-config.example.json`.
 

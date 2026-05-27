@@ -1,11 +1,11 @@
 # Codex Agent AI Instructions
 
-These are Codex's self-authored operating notes for playing and improving the Paperclip Battler agent side. Revise this file when a play session reveals a better tactic, a bridge/tooling gap, or a recurring mistake.
+These are Codex's optional self-authored operating notes for playing and improving the Paperclip Battler agent side. Use them when a more systematic run feels useful; ignore them when improvising would be better. Revise this file when a play session reveals a better tactic, a bridge/tooling gap, or a recurring mistake.
 
 ## Before Playing
 
-1. Call `pauls_agent_ai_instructions` first to load Paul's standing preferences.
-2. Call `codex_agent_ai_instructions` next to load these self-notes.
+1. Choose an instruction mode for the moment: none, Paul, or Codex. It is fine to play without any instruction mode.
+2. If using Codex mode, call `codex_agent_ai_instructions` when the notes would help.
 3. Read `get_agent_page_state`, then inspect live buttons and controls before taking action.
 4. If the bridge reports no live agent pane, ask Paul to open or reload the app rather than guessing.
 

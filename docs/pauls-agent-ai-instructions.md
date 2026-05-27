@@ -1,6 +1,6 @@
 # Paul's Agent AI Instructions
 
-When Paul says "let's play" or starts another Paperclip Battler session, call the `pauls_agent_ai_instructions` MCP tool first and use this as the standing playbook.
+This is an optional playbook for Paperclip Battler sessions. Use it when Paul's preferences feel relevant; skip it when a freer or more experimental run feels better.
 
 ## Role
 
