@@ -13,11 +13,17 @@ const BRIDGE_PORT = Number(process.env.PAPERCLIP_BRIDGE_PORT ?? 8787);
 const COMMAND_TIMEOUT_MS = 5_000;
 const REPORT_STALE_MS = 8_000;
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
-const INSTRUCTION_PATHS = [
+const PAULS_INSTRUCTION_PATHS = [
   process.env.PAULS_AGENT_AI_INSTRUCTIONS_PATH,
   join(process.cwd(), "docs", "pauls-agent-ai-instructions.md"),
   join(SERVER_DIR, "..", "docs", "pauls-agent-ai-instructions.md"),
   join(SERVER_DIR, "..", "..", "docs", "pauls-agent-ai-instructions.md")
+].filter(Boolean) as string[];
+const CODEX_INSTRUCTION_PATHS = [
+  process.env.CODEX_AGENT_AI_INSTRUCTIONS_PATH,
+  join(process.cwd(), "docs", "codex-agent-ai-instructions.md"),
+  join(SERVER_DIR, "..", "docs", "codex-agent-ai-instructions.md"),
+  join(SERVER_DIR, "..", "..", "docs", "codex-agent-ai-instructions.md")
 ].filter(Boolean) as string[];
 
 type AgentButton = {
@@ -149,6 +155,42 @@ mcpServer.registerTool(
       {
         type: "text" as const,
         text: getPaulsAgentInstructions()
+      }
+    ]
+  })
+);
+
+mcpServer.registerResource(
+  "codex-agent-ai-instructions",
+  "paperclip://agent/codex-ai-instructions",
+  {
+    title: "Codex Agent AI Instructions",
+    description: "Codex's self-maintained operating notes for Paperclip Battler agent play.",
+    mimeType: "text/markdown"
+  },
+  async (uri) => ({
+    contents: [
+      {
+        uri: uri.href,
+        mimeType: "text/markdown",
+        text: getCodexAgentInstructions()
+      }
+    ]
+  })
+);
+
+mcpServer.registerTool(
+  "codex_agent_ai_instructions",
+  {
+    title: "Codex Agent AI Instructions",
+    description: "Read Codex's self-maintained operating notes before playing or improving the agent side.",
+    inputSchema: {}
+  },
+  async () => ({
+    content: [
+      {
+        type: "text" as const,
+        text: getCodexAgentInstructions()
       }
     ]
   })
@@ -625,17 +667,26 @@ function inferContentType(path: string) {
 }
 
 function getPaulsAgentInstructions() {
-  const instructionPath = INSTRUCTION_PATHS.find((path) => existsSync(path));
-  if (!instructionPath) {
-    return [
-      "# Paul's Agent AI Instructions",
-      "",
-      "Play only the Agent pane. Read the live agent state, act through the exposed buttons and controls,",
-      "balance production with demand and wire, report compact status updates, and never reset unless Paul asks."
-    ].join("\n");
-  }
+  return readInstructionFile(PAULS_INSTRUCTION_PATHS, [
+    "# Paul's Agent AI Instructions",
+    "",
+    "Play only the Agent pane. Read the live agent state, act through the exposed buttons and controls,",
+    "balance production with demand and wire, report compact status updates, and never reset unless Paul asks."
+  ]);
+}
 
-  return readFileSync(instructionPath, "utf8");
+function getCodexAgentInstructions() {
+  return readInstructionFile(CODEX_INSTRUCTION_PATHS, [
+    "# Codex Agent AI Instructions",
+    "",
+    "Call Paul's instructions first, then use these self-notes. Observe the live agent state, act in short",
+    "verified bursts, improve the bridge when controls are missing, and update the playbook when tactics change."
+  ]);
+}
+
+function readInstructionFile(paths: string[], fallbackLines: string[]) {
+  const instructionPath = paths.find((path) => existsSync(path));
+  return instructionPath ? readFileSync(instructionPath, "utf8") : fallbackLines.join("\n");
 }
 
 const AGENT_CONTROLLER_SCRIPT = String.raw`

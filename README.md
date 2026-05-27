@@ -34,6 +34,7 @@ The MCP process also starts a local browser bridge at `http://127.0.0.1:8787`. T
 Available MCP tools:
 
 - `pauls_agent_ai_instructions`
+- `codex_agent_ai_instructions`
 - `get_agent_page_state`
 - `list_agent_buttons`
 - `click_agent_button`
@@ -41,7 +42,7 @@ Available MCP tools:
 - `set_agent_control`
 - `reset_agent_page`
 
-Paul's standing playbook lives at `docs/pauls-agent-ai-instructions.md`; the MCP tool reads that file so it can be edited directly.
+Paul's standing playbook lives at `docs/pauls-agent-ai-instructions.md`; Codex's self-maintained operating notes live at `docs/codex-agent-ai-instructions.md`. The MCP tools read those files so they can be edited directly.
 
 For local development and chat-driven play, the bridge also exposes:
 
@@ -54,3 +55,4 @@ Useful environment variables:
 
 - `PAPERCLIP_BRIDGE_PORT=8787`
 - `PAULS_AGENT_AI_INSTRUCTIONS_PATH=F:\Projects\paperclip-battler\docs\pauls-agent-ai-instructions.md`
+- `CODEX_AGENT_AI_INSTRUCTIONS_PATH=F:\Projects\paperclip-battler\docs\codex-agent-ai-instructions.md`
