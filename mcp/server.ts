@@ -243,6 +243,39 @@ function startBridge() {
         return;
       }
 
+      if (request.method === "POST" && url.pathname === "/command/click") {
+        const body = await readJsonBody<{ buttonId?: string; index?: number; text?: string }>(request);
+        const button = resolveButton(body);
+        const result = await queueCommand({
+          id: randomUUID(),
+          type: "click",
+          buttonId: button.id,
+          selector: button.selector,
+          text: button.text
+        });
+        sendJson(response, 200, { ok: result.ok, button, result, state: summarizeReport(latestReport) });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/command/set-control") {
+        const body = await readJsonBody<{
+          controlId?: string;
+          index?: number;
+          label?: string;
+          value?: string;
+        }>(request);
+        const control = resolveControl(body);
+        const result = await queueCommand({
+          id: randomUUID(),
+          type: "set-control",
+          controlId: control.id,
+          selector: control.selector,
+          value: String(body.value ?? "")
+        });
+        sendJson(response, 200, { ok: result.ok, control, result, state: summarizeReport(latestReport) });
+        return;
+      }
+
       if (request.method === "POST" && url.pathname === "/agent-control/report") {
         latestReport = normalizeReport(await readJsonBody<AgentReport>(request));
         sendJson(response, 200, { ok: true });

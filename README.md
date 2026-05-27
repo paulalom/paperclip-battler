@@ -40,6 +40,11 @@ Available MCP tools:
 - `set_agent_control`
 - `reset_agent_page`
 
+For local development and chat-driven play, the bridge also exposes:
+
+- `POST /command/click` with `{ "buttonId": "btnMakePaperclip" }`
+- `POST /command/set-control` with `{ "controlId": "stratPicker", "value": "0" }`
+
 An example client config is included at `mcp-config.example.json`.
 
 Useful environment variables:
