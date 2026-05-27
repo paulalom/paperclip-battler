@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import * as z from "zod/v4";
@@ -9,6 +12,13 @@ const ORIGINAL_ENTRY = "index2.html";
 const BRIDGE_PORT = Number(process.env.PAPERCLIP_BRIDGE_PORT ?? 8787);
 const COMMAND_TIMEOUT_MS = 5_000;
 const REPORT_STALE_MS = 8_000;
+const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
+const INSTRUCTION_PATHS = [
+  process.env.PAULS_AGENT_AI_INSTRUCTIONS_PATH,
+  join(process.cwd(), "docs", "pauls-agent-ai-instructions.md"),
+  join(SERVER_DIR, "..", "docs", "pauls-agent-ai-instructions.md"),
+  join(SERVER_DIR, "..", "..", "docs", "pauls-agent-ai-instructions.md")
+].filter(Boolean) as string[];
 
 type AgentButton = {
   id: string;
@@ -103,6 +113,42 @@ mcpServer.registerResource(
         uri: uri.href,
         mimeType: "application/json",
         text: JSON.stringify(getBridgeState(), null, 2)
+      }
+    ]
+  })
+);
+
+mcpServer.registerResource(
+  "pauls-agent-ai-instructions",
+  "paperclip://agent/pauls-ai-instructions",
+  {
+    title: "Paul's Agent AI Instructions",
+    description: "Standing playbook to consult before playing Paperclip Battler for Paul.",
+    mimeType: "text/markdown"
+  },
+  async (uri) => ({
+    contents: [
+      {
+        uri: uri.href,
+        mimeType: "text/markdown",
+        text: getPaulsAgentInstructions()
+      }
+    ]
+  })
+);
+
+mcpServer.registerTool(
+  "pauls_agent_ai_instructions",
+  {
+    title: "Paul's Agent AI Instructions",
+    description: "Read Paul's standing instructions before playing the Agent side of Paperclip Battler.",
+    inputSchema: {}
+  },
+  async () => ({
+    content: [
+      {
+        type: "text" as const,
+        text: getPaulsAgentInstructions()
       }
     ]
   })
@@ -576,6 +622,20 @@ function inferContentType(path: string) {
   if (path.endsWith(".jpg") || path.endsWith(".jpeg")) return "image/jpeg";
   if (path.endsWith(".gif")) return "image/gif";
   return "application/octet-stream";
+}
+
+function getPaulsAgentInstructions() {
+  const instructionPath = INSTRUCTION_PATHS.find((path) => existsSync(path));
+  if (!instructionPath) {
+    return [
+      "# Paul's Agent AI Instructions",
+      "",
+      "Play only the Agent pane. Read the live agent state, act through the exposed buttons and controls,",
+      "balance production with demand and wire, report compact status updates, and never reset unless Paul asks."
+    ].join("\n");
+  }
+
+  return readFileSync(instructionPath, "utf8");
 }
 
 const AGENT_CONTROLLER_SCRIPT = String.raw`
