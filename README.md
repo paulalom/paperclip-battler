@@ -1,8 +1,8 @@
 # Paperclip Battler
 
-A side-by-side incremental paperclip game for comparing a human run against an agent run.
+A side-by-side wrapper for comparing a human Universal Paperclips run against an agent-controlled run.
 
-This is an original implementation inspired by, and credited to, the web game [Universal Paperclips](https://www.decisionproblem.com/paperclips/index2.html). It does not copy the original game's source or assets.
+This project loads the live web version of [Universal Paperclips](https://www.decisionproblem.com/paperclips/index2.html) and credits the original game. The original source/assets are not vendored into this repository.
 
 ## Run
 
@@ -29,20 +29,19 @@ Run it as a stdio MCP server:
 npm run mcp:start
 ```
 
-The MCP process also starts a local browser bridge at `http://127.0.0.1:8787` so the app can display the agent's live game state.
+The MCP process also starts a local browser bridge at `http://127.0.0.1:8787`. The Player pane loads the original site directly. The Agent pane loads the original site through the bridge so a tiny control script can report visible buttons/controls and execute MCP commands.
 
 Available MCP tools:
 
-- `get_agent_state`
-- `list_agent_actions`
-- `take_agent_action`
-- `advance_agent_game`
-- `suggest_agent_action`
-- `reset_agent_game`
+- `get_agent_page_state`
+- `list_agent_buttons`
+- `click_agent_button`
+- `list_agent_controls`
+- `set_agent_control`
+- `reset_agent_page`
 
 An example client config is included at `mcp-config.example.json`.
 
 Useful environment variables:
 
 - `PAPERCLIP_BRIDGE_PORT=8787`
-- `PAPERCLIP_STATE_PATH=F:\Projects\paperclip-battler\.paperclip-agent-state.json`
