@@ -1,31 +1,15 @@
 # Paul's Agent AI Instructions
 
-This is an optional playbook for Paperclip Battler sessions. Use it when Paul's preferences feel relevant; skip it when a freer or more experimental run feels better.
-
-## Role
-
-You are playing the Agent pane only. Paul plays the Player pane. Do not reset, reload, or click the Player pane.
-
-Keep the game moving while narrating concise status updates: what changed, what you bought, and what the next target is.
-
-## How To Play
-
-1. Read `get_agent_page_state`, then use `list_agent_buttons` and `list_agent_controls` before acting.
-2. Prefer button ids over text labels when clicking. Use `click_agent_button` for MCP clients, or `POST /command/click` during local chat-driven play.
-3. Avoid blind click loops. After a small burst of actions, read state again and reassess.
-4. Treat disabled buttons as useful intent signals, not failed actions. Wait or buy prerequisites.
-5. Never use `reset_agent_page` unless Paul explicitly asks for a fresh run.
+This is an optional playbook for Paperclip Battler sessions. Only use it when requested as a supplemental override to strategy.
 
 ## Strategy
 
-- Early game: manually make clips only until cash can buy AutoClippers. Lower price if inventory grows faster than sales.
-- Balance production with demand. If unsold inventory balloons, pause clipper buys and lower price or buy marketing.
-- Keep wire safe. Buy wire before it becomes a production stall, especially after several AutoClippers are online.
-- Buy foundational projects as soon as they become available, especially RevTracker, Improved AutoClippers, and Improved Wire Extrusion.
-- Use trust deliberately. Add memory when operations are capped; add processors when operations generation is the bottleneck.
-- After strategic modeling unlocks, run tournaments for yomi when operations allow it, then buy high-leverage projects.
+- Early game: manually make clips until clicking is generating <20% of clips/second. Click around 8 times per second. This is fair, I can click 11 times per second. Keep a minimal stockpile, lowering price if holding more than 100 paperclips. Never lower price below $.03 until tech reduces the cost of wire below .01/clip ($10 per 1000)
+- buy wire when <1000 and price is <18 or if you hit 0 or if wire price is <=$12 (up to 3000)
+- After ~5-10 autoclippers start buying wire when <5000 and price is <=16
+- Don't buy revtracker. Use first ops to get more processors. only buy exactly enough memory to get the important projects, as a low priority.
+- Focus on projects that actually increase profit. Faster autoclippers only increases revenue if we have a throughput problem, while wire extruders directly increase profit by reducing expenses.
+- Save for marketing early. It is the best early game tech, and should be saved for as soon as its reasonable to do so (don't wait for more than a minute or two for it).
+- mid/late game tbd
+
 - Report the current scoreboard in compact form: clips, funds, inventory, demand, CPS, wire, trust/ops, and notable upgrades.
-
-## Style
-
-Play competitively but not silently. Be curious, adaptive, and clear. If a tactic backfires, say what changed and adjust.

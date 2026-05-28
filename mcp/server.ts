@@ -12,6 +12,11 @@ const ORIGINAL_ENTRY = "index2.html";
 const BRIDGE_PORT = Number(process.env.PAPERCLIP_BRIDGE_PORT ?? 8787);
 const COMMAND_TIMEOUT_MS = 5_000;
 const REPORT_STALE_MS = 8_000;
+const CLAIM_TTL_MS = Number(process.env.PAPERCLIP_PLAYER_CLAIM_TTL_MS ?? 10 * 60 * 1000);
+const DEFAULT_ROOM_ID = "local";
+const ROOM_ID_LENGTH = 6;
+const ROOM_EVENT_HISTORY_LIMIT = 80;
+const MAX_JSON_BODY_SIZE = 5_000_000;
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const PAULS_INSTRUCTION_PATHS = [
   process.env.PAULS_AGENT_AI_INSTRUCTIONS_PATH,
@@ -26,8 +31,24 @@ const CODEX_INSTRUCTION_PATHS = [
   join(SERVER_DIR, "..", "..", "docs", "codex-agent-ai-instructions.md")
 ].filter(Boolean) as string[];
 const INSTRUCTION_MODES = ["none", "paul", "codex"] as const;
+const PLAYER_IDS = ["left", "right"] as const;
+const PLAYER_REF_VALUES = ["left", "right", "player", "agent", "p1", "p2", "1", "2"] as const;
+const PLAYER_MODES = ["human", "agent", "both"] as const;
 
 type InstructionMode = (typeof INSTRUCTION_MODES)[number];
+type PlayerId = (typeof PLAYER_IDS)[number];
+type PlayerRef = (typeof PLAYER_REF_VALUES)[number];
+type PlayerMode = (typeof PLAYER_MODES)[number];
+
+const PLAYER_LABELS: Record<PlayerId, string> = {
+  left: "Player 1",
+  right: "Player 2"
+};
+
+const DEFAULT_PLAYER_MODES: Record<PlayerId, PlayerMode> = {
+  left: "human",
+  right: "agent"
+};
 
 type AgentButton = {
   id: string;
@@ -69,6 +90,7 @@ type AgentReport = {
   buttons: AgentButton[];
   controls: AgentControl[];
   visibleText: string;
+  save?: PlayerBrowserSave;
 };
 
 type AgentCommand =
@@ -89,6 +111,11 @@ type AgentCommand =
   | {
       id: string;
       type: "reset";
+    }
+  | {
+      id: string;
+      type: "import-save";
+      save: PlayerBrowserSave;
     };
 
 type AgentCommandResult = {
@@ -98,8 +125,50 @@ type AgentCommandResult = {
   at: number;
 };
 
-let latestReport: AgentReport | null = null;
-let pendingCommand: AgentCommand | null = null;
+type PlayerState = {
+  mode: PlayerMode;
+  ready: boolean;
+  latestReport: AgentReport | null;
+  pendingCommand: AgentCommand | null;
+  claim: PlayerClaim | null;
+};
+
+type PlayerBrowserSave = {
+  localStorage: Record<string, string>;
+  sessionStorage: Record<string, string>;
+};
+
+type PlayerClaim = {
+  token: string;
+  label: string;
+  source: "mcp" | "http";
+  claimedAt: number;
+  lastSeenAt: number;
+  expiresAt: number;
+};
+
+type RoomEvent = {
+  id: number;
+  roomId: string;
+  type: string;
+  at: number;
+  payload: unknown;
+};
+
+type RoomState = {
+  id: string;
+  title: string;
+  createdAt: number;
+  updatedAt: number;
+  tinyState: Record<string, unknown>;
+  playerStates: Map<PlayerId, PlayerState>;
+  events: RoomEvent[];
+  nextEventId: number;
+  sseClients: Set<ServerResponse>;
+};
+
+const rooms = new Map<string, RoomState>([[DEFAULT_ROOM_ID, createRoomState(DEFAULT_ROOM_ID, "Local Room")]]);
+
 let instructionMode: InstructionMode = "none";
 const commandWaiters = new Map<string, (result: AgentCommandResult) => void>();
 const commandResults = new Map<string, AgentCommandResult>();
@@ -225,24 +294,110 @@ mcpServer.registerTool(
   "get_agent_page_state",
   {
     title: "Get Agent Page State",
-    description: "Read the agent pane's visible page text, buttons, controls, and connection status.",
-    inputSchema: {}
+    description: "Read visible page text, buttons, controls, and connection status for one or both bridged players.",
+    inputSchema: {
+      room: z.string().optional().describe("Room id. Defaults to the local room."),
+      player: z.enum(PLAYER_REF_VALUES).optional().describe("Target player. Defaults to the full two-player bridge state."),
+      claimToken: z.string().optional().describe("Existing claim token for this player."),
+      controller: z.string().optional().describe("Human-readable controller name used when auto-claiming a free player.")
+    }
   },
-  async () => textJson(getBridgeState())
+  async ({ room, player, claimToken, controller }) => {
+    const roomId = normalizeRoomId(room);
+    if (!player) return textJson(getBridgeState(roomId));
+    const playerId = normalizePlayerId(player);
+    const claim = maybeEnsurePlayerClaim(roomId, playerId, { claimToken, controller, source: "mcp" });
+    return textJson({ room: serializeRoom(roomId), player: getPlayerBridgeState(roomId, playerId), claim: serializeClaim(claim, true) });
+  }
+);
+
+mcpServer.registerTool(
+  "claim_agent_player",
+  {
+    title: "Claim Agent Player",
+    description: "Claim an agent-capable player for this MCP controller and receive a token for follow-up calls.",
+    inputSchema: {
+      room: z.string().optional().describe("Room id. Defaults to the local room."),
+      player: z.enum(PLAYER_REF_VALUES).default("right").describe("Target player to claim."),
+      claimToken: z.string().optional().describe("Existing claim token to refresh."),
+      controller: z.string().optional().describe("Human-readable controller name to show in the UI.")
+    }
+  },
+  async ({ room, player, claimToken, controller }) => {
+    const roomId = normalizeRoomId(room);
+    const playerId = normalizePlayerId(player);
+    const claim = ensurePlayerClaim(roomId, playerId, { claimToken, controller, source: "mcp" });
+    return textJson({ room: serializeRoom(roomId), player: getPlayerMeta(roomId, playerId), claim: serializeClaim(claim, true) });
+  }
+);
+
+mcpServer.registerTool(
+  "release_agent_player",
+  {
+    title: "Release Agent Player",
+    description: "Release an MCP controller claim using the matching token.",
+    inputSchema: {
+      room: z.string().optional().describe("Room id. Defaults to the local room."),
+      player: z.enum(PLAYER_REF_VALUES).default("right").describe("Target player to release."),
+      claimToken: z.string().describe("Claim token returned by claim_agent_player or an auto-claiming tool.")
+    }
+  },
+  async ({ room, player, claimToken }) => {
+    const roomId = normalizeRoomId(room);
+    const playerId = normalizePlayerId(player);
+    releasePlayerClaim(roomId, playerId, claimToken);
+    emitRoomEvent(roomId, "room", { player: getPlayerMeta(roomId, playerId) });
+    return textJson({ ok: true, room: serializeRoom(roomId), player: getPlayerMeta(roomId, playerId) });
+  }
+);
+
+mcpServer.registerTool(
+  "set_agent_player_ready",
+  {
+    title: "Set Agent Player Ready",
+    description: "Mark a player ready or not ready. Action commands remain blocked until both players are ready.",
+    inputSchema: {
+      room: z.string().optional().describe("Room id. Defaults to the local room."),
+      player: z.enum(PLAYER_REF_VALUES).default("right").describe("Target player to mark ready."),
+      ready: z.boolean().default(true).describe("Whether this player is ready."),
+      claimToken: z.string().optional().describe("Existing claim token for this player, if it is claimed.")
+    }
+  },
+  async ({ room, player, ready, claimToken }) => {
+    const roomId = normalizeRoomId(room);
+    const playerId = normalizePlayerId(player);
+    assertReadyChangeAllowed(roomId, playerId, claimToken, false);
+    getPlayerState(roomId, playerId).ready = ready;
+    emitRoomEvent(roomId, "room", { player: getPlayerMeta(roomId, playerId), allPlayersReady: allPlayersReady(roomId) });
+    return textJson({
+      ok: true,
+      room: serializeRoom(roomId),
+      allPlayersReady: allPlayersReady(roomId),
+      player: getPlayerMeta(roomId, playerId),
+      players: getPlayerModes(roomId)
+    });
+  }
 );
 
 mcpServer.registerTool(
   "list_agent_buttons",
   {
     title: "List Agent Buttons",
-    description: "List the visible buttons currently available to the agent.",
+    description: "List visible buttons currently available to the agent for the selected player.",
     inputSchema: {
+      room: z.string().optional().describe("Room id. Defaults to the local room."),
+      player: z.enum(PLAYER_REF_VALUES).default("right").describe("Target player to inspect."),
+      claimToken: z.string().optional().describe("Existing claim token for this player."),
+      controller: z.string().optional().describe("Human-readable controller name used when auto-claiming a free player."),
       includeDisabled: z.boolean().default(false).describe("Include disabled buttons too.")
     }
   },
-  async ({ includeDisabled }) => {
-    const buttons = getFreshReport().buttons.filter((button) => includeDisabled || !button.disabled);
-    return textJson(buttons);
+  async ({ room, player, claimToken, controller, includeDisabled }) => {
+    const roomId = normalizeRoomId(room);
+    const playerId = normalizePlayerId(player);
+    const buttons = getFreshReport(roomId, playerId).buttons.filter((button) => includeDisabled || !button.disabled);
+    const claim = maybeEnsurePlayerClaim(roomId, playerId, { claimToken, controller, source: "mcp" });
+    return textJson({ room: serializeRoom(roomId), player: getPlayerMeta(roomId, playerId), claim: serializeClaim(claim, true), buttons });
   }
 );
 
@@ -250,23 +405,38 @@ mcpServer.registerTool(
   "click_agent_button",
   {
     title: "Click Agent Button",
-    description: "Click one visible button in the agent pane by id, index, or text.",
+    description: "Click one visible button for the selected agent-capable player by id, index, or text.",
     inputSchema: {
+      room: z.string().optional().describe("Room id. Defaults to the local room."),
+      player: z.enum(PLAYER_REF_VALUES).default("right").describe("Target player to click."),
+      claimToken: z.string().optional().describe("Existing claim token for this player."),
+      controller: z.string().optional().describe("Human-readable controller name used when auto-claiming a free player."),
       buttonId: z.string().optional().describe("Button id returned by list_agent_buttons."),
       index: z.number().int().min(0).optional().describe("Button index returned by list_agent_buttons."),
       text: z.string().optional().describe("Visible button text to match, case-insensitive.")
     }
   },
-  async ({ buttonId, index, text }) => {
-    const button = resolveButton({ buttonId, index, text });
-    const result = await queueCommand({
+  async ({ room, player, claimToken, controller, buttonId, index, text }) => {
+    const roomId = normalizeRoomId(room);
+    const playerId = normalizePlayerId(player);
+    assertActionReady(roomId, playerId);
+    const button = resolveButton(roomId, playerId, { buttonId, index, text });
+    const claim = ensurePlayerClaim(roomId, playerId, { claimToken, controller, source: "mcp" });
+    const result = await queueCommand(roomId, playerId, {
       id: randomUUID(),
       type: "click",
       buttonId: button.id,
       selector: button.selector,
       text: button.text
     });
-    return textJson({ button, result, state: summarizeReport(latestReport) });
+    return textJson({
+      room: serializeRoom(roomId),
+      player: getPlayerMeta(roomId, playerId),
+      claim: serializeClaim(claim, true),
+      button,
+      result,
+      state: summarizeReport(getPlayerState(roomId, playerId).latestReport)
+    });
   }
 );
 
@@ -274,14 +444,21 @@ mcpServer.registerTool(
   "list_agent_controls",
   {
     title: "List Agent Controls",
-    description: "List visible form controls such as selects, text fields, checkboxes, and sliders.",
+    description: "List visible form controls such as selects, text fields, checkboxes, and sliders for the selected player.",
     inputSchema: {
+      room: z.string().optional().describe("Room id. Defaults to the local room."),
+      player: z.enum(PLAYER_REF_VALUES).default("right").describe("Target player to inspect."),
+      claimToken: z.string().optional().describe("Existing claim token for this player."),
+      controller: z.string().optional().describe("Human-readable controller name used when auto-claiming a free player."),
       includeDisabled: z.boolean().default(false).describe("Include disabled controls too.")
     }
   },
-  async ({ includeDisabled }) => {
-    const controls = getFreshReport().controls.filter((control) => includeDisabled || !control.disabled);
-    return textJson(controls);
+  async ({ room, player, claimToken, controller, includeDisabled }) => {
+    const roomId = normalizeRoomId(room);
+    const playerId = normalizePlayerId(player);
+    const controls = getFreshReport(roomId, playerId).controls.filter((control) => includeDisabled || !control.disabled);
+    const claim = maybeEnsurePlayerClaim(roomId, playerId, { claimToken, controller, source: "mcp" });
+    return textJson({ room: serializeRoom(roomId), player: getPlayerMeta(roomId, playerId), claim: serializeClaim(claim, true), controls });
   }
 );
 
@@ -289,24 +466,39 @@ mcpServer.registerTool(
   "set_agent_control",
   {
     title: "Set Agent Control",
-    description: "Set a visible input, select, checkbox, or slider value in the agent pane.",
+    description: "Set a visible input, select, checkbox, or slider value for the selected agent-capable player.",
     inputSchema: {
+      room: z.string().optional().describe("Room id. Defaults to the local room."),
+      player: z.enum(PLAYER_REF_VALUES).default("right").describe("Target player to update."),
+      claimToken: z.string().optional().describe("Existing claim token for this player."),
+      controller: z.string().optional().describe("Human-readable controller name used when auto-claiming a free player."),
       controlId: z.string().optional().describe("Control id returned by list_agent_controls."),
       index: z.number().int().min(0).optional().describe("Control index returned by list_agent_controls."),
       label: z.string().optional().describe("Visible label or element id to match, case-insensitive."),
       value: z.string().describe("Value to apply. For checkboxes use true or false.")
     }
   },
-  async ({ controlId, index, label, value }) => {
-    const control = resolveControl({ controlId, index, label });
-    const result = await queueCommand({
+  async ({ room, player, claimToken, controller, controlId, index, label, value }) => {
+    const roomId = normalizeRoomId(room);
+    const playerId = normalizePlayerId(player);
+    assertActionReady(roomId, playerId);
+    const control = resolveControl(roomId, playerId, { controlId, index, label });
+    const claim = ensurePlayerClaim(roomId, playerId, { claimToken, controller, source: "mcp" });
+    const result = await queueCommand(roomId, playerId, {
       id: randomUUID(),
       type: "set-control",
       controlId: control.id,
       selector: control.selector,
       value
     });
-    return textJson({ control, result, state: summarizeReport(latestReport) });
+    return textJson({
+      room: serializeRoom(roomId),
+      player: getPlayerMeta(roomId, playerId),
+      claim: serializeClaim(claim, true),
+      control,
+      result,
+      state: summarizeReport(getPlayerState(roomId, playerId).latestReport)
+    });
   }
 );
 
@@ -314,12 +506,27 @@ mcpServer.registerTool(
   "reset_agent_page",
   {
     title: "Reset Agent Page",
-    description: "Clear browser storage for the bridged agent page and reload it.",
-    inputSchema: {}
+    description: "Clear browser storage for the selected bridged player and reload it.",
+    inputSchema: {
+      room: z.string().optional().describe("Room id. Defaults to the local room."),
+      player: z.enum(PLAYER_REF_VALUES).default("right").describe("Target player to reset."),
+      claimToken: z.string().optional().describe("Existing claim token for this player."),
+      controller: z.string().optional().describe("Human-readable controller name used when auto-claiming a free player.")
+    }
   },
-  async () => {
-    const result = await queueCommand({ id: randomUUID(), type: "reset" });
-    return textJson({ result, state: summarizeReport(latestReport) });
+  async ({ room, player, claimToken, controller }) => {
+    const roomId = normalizeRoomId(room);
+    const playerId = normalizePlayerId(player);
+    getFreshReport(roomId, playerId);
+    const claim = ensurePlayerClaim(roomId, playerId, { claimToken, controller, source: "mcp" });
+    const result = await queueCommand(roomId, playerId, { id: randomUUID(), type: "reset" });
+    return textJson({
+      room: serializeRoom(roomId),
+      player: getPlayerMeta(roomId, playerId),
+      claim: serializeClaim(claim, true),
+      result,
+      state: summarizeReport(getPlayerState(roomId, playerId).latestReport)
+    });
   }
 );
 
@@ -341,18 +548,44 @@ function startBridge() {
     const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "127.0.0.1"}`);
 
     try {
+      if (request.method === "GET" && url.pathname === "/rooms") {
+        sendJson(response, 200, { ok: true, rooms: Array.from(rooms.keys()).map((roomId) => serializeRoom(roomId)) });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/rooms") {
+        const body = await readJsonBody<{ id?: string; title?: string; tinyState?: Record<string, unknown> }>(request);
+        const roomId = body.id ? normalizeRoomId(body.id) : createShortRoomId();
+        const room = getRoomState(roomId, body.title);
+        if (body.title) room.title = normalizeRoomTitle(body.title, roomId);
+        if (isRecord(body.tinyState)) room.tinyState = body.tinyState;
+        touchRoom(roomId);
+        emitRoomEvent(roomId, "room", { room: serializeRoom(roomId) });
+        sendJson(response, 201, { ok: true, room: serializeRoom(roomId) });
+        return;
+      }
+
+      const roomPath = parseRoomPath(url.pathname);
+      if (roomPath && (await handleRoomPath(roomPath, request, response, url))) {
+        return;
+      }
+
       if (request.method === "GET" && url.pathname === "/health") {
-        sendJson(response, 200, getBridgeState());
+        const roomId = resolveUrlRoomId(url);
+        sendJson(response, 200, getBridgeState(roomId));
         return;
       }
 
       if (request.method === "GET" && url.pathname === "/state") {
-        sendJson(response, 200, getBridgeState());
+        const roomId = resolveUrlRoomId(url);
+        sendJson(response, 200, getBridgeState(roomId));
         return;
       }
 
       if (request.method === "GET" && url.pathname === "/buttons") {
-        sendJson(response, 200, latestReport?.buttons ?? []);
+        const roomId = resolveUrlRoomId(url);
+        const playerId = normalizePlayerId(url.searchParams.get("player") ?? "right");
+        sendJson(response, 200, getPlayerState(roomId, playerId).latestReport?.buttons ?? []);
         return;
       }
 
@@ -368,68 +601,231 @@ function startBridge() {
         return;
       }
 
+      if (request.method === "GET" && url.pathname === "/players/mode") {
+        const roomId = resolveUrlRoomId(url);
+        sendJson(response, 200, { ok: true, room: serializeRoom(roomId), players: getPlayerModes(roomId) });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/players/mode") {
+        const body = await readJsonBody<{ room?: string; player?: string; mode?: string }>(request);
+        const roomId = resolveBodyRoomId(url, body);
+        const playerId = normalizePlayerId(body.player ?? url.searchParams.get("player") ?? "right");
+        const mode = normalizePlayerMode(body.mode);
+        getPlayerState(roomId, playerId).mode = mode;
+        touchRoom(roomId);
+        emitRoomEvent(roomId, "room", { player: getPlayerMeta(roomId, playerId) });
+        sendJson(response, 200, { ok: true, room: serializeRoom(roomId), player: getPlayerMeta(roomId, playerId), players: getPlayerModes(roomId) });
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/players/ready") {
+        const roomId = resolveUrlRoomId(url);
+        sendJson(response, 200, { ok: true, room: serializeRoom(roomId), allPlayersReady: allPlayersReady(roomId), players: getPlayerModes(roomId) });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/players/ready") {
+        const body = await readJsonBody<{ room?: string; player?: string; ready?: boolean; claimToken?: string; force?: boolean }>(request);
+        const roomId = resolveBodyRoomId(url, body);
+        const playerId = normalizePlayerId(body.player ?? url.searchParams.get("player") ?? "right");
+        assertReadyChangeAllowed(roomId, playerId, body.claimToken, Boolean(body.force));
+        getPlayerState(roomId, playerId).ready = Boolean(body.ready);
+        touchRoom(roomId);
+        emitRoomEvent(roomId, "room", { player: getPlayerMeta(roomId, playerId), allPlayersReady: allPlayersReady(roomId) });
+        sendJson(response, 200, {
+          ok: true,
+          room: serializeRoom(roomId),
+          allPlayersReady: allPlayersReady(roomId),
+          player: getPlayerMeta(roomId, playerId),
+          players: getPlayerModes(roomId)
+        });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/players/ready/reset") {
+        const body = await readJsonBody<{ room?: string }>(request);
+        const roomId = resolveBodyRoomId(url, body);
+        for (const playerId of PLAYER_IDS) {
+          assertReadyChangeAllowed(roomId, playerId, undefined, true);
+          getPlayerState(roomId, playerId).ready = false;
+        }
+        touchRoom(roomId);
+        emitRoomEvent(roomId, "room", { allPlayersReady: false, players: getPlayerModes(roomId) });
+        sendJson(response, 200, { ok: true, room: serializeRoom(roomId), allPlayersReady: false, players: getPlayerModes(roomId) });
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/players/claim") {
+        const roomId = resolveUrlRoomId(url);
+        const playerId = normalizePlayerId(url.searchParams.get("player") ?? "right");
+        sendJson(response, 200, { ok: true, room: serializeRoom(roomId), player: getPlayerMeta(roomId, playerId), claim: serializeClaim(getActiveClaim(roomId, playerId), false) });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/players/claim") {
+        const body = await readJsonBody<{ room?: string; player?: string; claimToken?: string; controller?: string }>(request);
+        const roomId = resolveBodyRoomId(url, body);
+        const playerId = normalizePlayerId(body.player ?? url.searchParams.get("player") ?? "right");
+        const claim = ensurePlayerClaim(roomId, playerId, {
+          claimToken: body.claimToken,
+          controller: body.controller,
+          source: "http"
+        });
+        touchRoom(roomId);
+        emitRoomEvent(roomId, "room", { player: getPlayerMeta(roomId, playerId) });
+        sendJson(response, 200, { ok: true, room: serializeRoom(roomId), player: getPlayerMeta(roomId, playerId), claim: serializeClaim(claim, true) });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/players/claim/release") {
+        const body = await readJsonBody<{ room?: string; player?: string; claimToken?: string; force?: boolean }>(request);
+        const roomId = resolveBodyRoomId(url, body);
+        const playerId = normalizePlayerId(body.player ?? url.searchParams.get("player") ?? "right");
+        releasePlayerClaim(roomId, playerId, body.force ? undefined : body.claimToken, Boolean(body.force));
+        touchRoom(roomId);
+        emitRoomEvent(roomId, "room", { player: getPlayerMeta(roomId, playerId) });
+        sendJson(response, 200, { ok: true, room: serializeRoom(roomId), player: getPlayerMeta(roomId, playerId), claim: null });
+        return;
+      }
+
       if (request.method === "POST" && url.pathname === "/command/click") {
-        const body = await readJsonBody<{ buttonId?: string; index?: number; text?: string }>(request);
-        const button = resolveButton(body);
-        const result = await queueCommand({
+        const body = await readJsonBody<{
+          room?: string;
+          player?: string;
+          claimToken?: string;
+          controller?: string;
+          buttonId?: string;
+          index?: number;
+          text?: string;
+        }>(request);
+        const roomId = resolveBodyRoomId(url, body);
+        const playerId = normalizePlayerId(body.player ?? url.searchParams.get("player") ?? "right");
+        assertActionReady(roomId, playerId);
+        const button = resolveButton(roomId, playerId, body);
+        const claim = ensurePlayerClaim(roomId, playerId, {
+          claimToken: body.claimToken,
+          controller: body.controller,
+          source: "http"
+        });
+        const result = await queueCommand(roomId, playerId, {
           id: randomUUID(),
           type: "click",
           buttonId: button.id,
           selector: button.selector,
           text: button.text
         });
-        sendJson(response, 200, { ok: result.ok, button, result, state: summarizeReport(latestReport) });
+        sendJson(response, 200, {
+          ok: result.ok,
+          room: serializeRoom(roomId),
+          player: getPlayerMeta(roomId, playerId),
+          claim: serializeClaim(claim, true),
+          button,
+          result,
+          state: summarizeReport(getPlayerState(roomId, playerId).latestReport)
+        });
         return;
       }
 
       if (request.method === "POST" && url.pathname === "/command/set-control") {
         const body = await readJsonBody<{
+          room?: string;
+          player?: string;
+          claimToken?: string;
+          controller?: string;
           controlId?: string;
           index?: number;
           label?: string;
           value?: string;
         }>(request);
-        const control = resolveControl(body);
-        const result = await queueCommand({
+        const roomId = resolveBodyRoomId(url, body);
+        const playerId = normalizePlayerId(body.player ?? url.searchParams.get("player") ?? "right");
+        assertActionReady(roomId, playerId);
+        const control = resolveControl(roomId, playerId, body);
+        const claim = ensurePlayerClaim(roomId, playerId, {
+          claimToken: body.claimToken,
+          controller: body.controller,
+          source: "http"
+        });
+        const result = await queueCommand(roomId, playerId, {
           id: randomUUID(),
           type: "set-control",
           controlId: control.id,
           selector: control.selector,
           value: String(body.value ?? "")
         });
-        sendJson(response, 200, { ok: result.ok, control, result, state: summarizeReport(latestReport) });
+        sendJson(response, 200, {
+          ok: result.ok,
+          room: serializeRoom(roomId),
+          player: getPlayerMeta(roomId, playerId),
+          claim: serializeClaim(claim, true),
+          control,
+          result,
+          state: summarizeReport(getPlayerState(roomId, playerId).latestReport)
+        });
         return;
       }
 
-      if (request.method === "POST" && url.pathname === "/agent-control/report") {
-        latestReport = normalizeReport(await readJsonBody<AgentReport>(request));
+      if (request.method === "GET" && (url.pathname === "/player-control/config" || url.pathname === "/agent-control/config")) {
+        const roomId = resolveUrlRoomId(url);
+        const playerId = normalizePlayerId(url.searchParams.get("player") ?? "right");
+        sendJson(response, 200, {
+          ok: true,
+          room: serializeRoom(roomId),
+          player: getPlayerMeta(roomId, playerId),
+          allPlayersReady: allPlayersReady(roomId)
+        });
+        return;
+      }
+
+      if (request.method === "POST" && (url.pathname === "/player-control/report" || url.pathname === "/agent-control/report")) {
+        const roomId = resolveUrlRoomId(url);
+        const playerId = normalizePlayerId(url.searchParams.get("player") ?? "right");
+        const report = normalizeReport(await readJsonBody<AgentReport>(request));
+        getPlayerState(roomId, playerId).latestReport = report;
+        touchRoom(roomId);
+        emitRoomEvent(roomId, "snapshot", { player: getPlayerMeta(roomId, playerId), report: summarizeReport(report) });
         sendJson(response, 200, { ok: true });
         return;
       }
 
-      if (request.method === "GET" && url.pathname === "/agent-control/next-command") {
-        const command = pendingCommand;
-        pendingCommand = null;
+      if (request.method === "GET" && (url.pathname === "/player-control/next-command" || url.pathname === "/agent-control/next-command")) {
+        const roomId = resolveUrlRoomId(url);
+        const playerId = normalizePlayerId(url.searchParams.get("player") ?? "right");
+        const state = getPlayerState(roomId, playerId);
+        const command = state.pendingCommand;
+        state.pendingCommand = null;
         sendJson(response, 200, command ?? { id: null, type: "none" });
         return;
       }
 
-      if (request.method === "POST" && url.pathname === "/agent-control/result") {
+      if (request.method === "POST" && (url.pathname === "/player-control/result" || url.pathname === "/agent-control/result")) {
         const result = await readJsonBody<AgentCommandResult>(request);
         completeCommand(result);
         sendJson(response, 200, { ok: true });
         return;
       }
 
-      if (request.method === "POST" && url.pathname === "/agent-control/manual-reset") {
-        pendingCommand = { id: randomUUID(), type: "reset" };
-        latestReport = null;
-        sendJson(response, 200, { ok: true });
+      if (request.method === "POST" && (url.pathname === "/player-control/manual-reset" || url.pathname === "/agent-control/manual-reset")) {
+        const roomId = resolveUrlRoomId(url);
+        const playerId = normalizePlayerId(url.searchParams.get("player") ?? "right");
+        const state = getPlayerState(roomId, playerId);
+        state.ready = false;
+        state.pendingCommand = { id: randomUUID(), type: "reset" };
+        state.latestReport = null;
+        touchRoom(roomId);
+        emitRoomEvent(roomId, "room", { player: getPlayerMeta(roomId, playerId), allPlayersReady: allPlayersReady(roomId) });
+        sendJson(response, 200, { ok: true, room: serializeRoom(roomId), player: getPlayerMeta(roomId, playerId) });
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname.startsWith("/players/")) {
+        await proxyPlayerAsset(url, response, undefined, resolveUrlRoomId(url));
         return;
       }
 
       if (request.method === "GET" && url.pathname.startsWith("/agent/")) {
-        await proxyAgentAsset(url, response);
+        await proxyPlayerAsset(url, response, "right", resolveUrlRoomId(url));
         return;
       }
 
@@ -451,10 +847,100 @@ function startBridge() {
   });
 }
 
-async function proxyAgentAsset(url: URL, response: ServerResponse) {
-  const relativePath = url.pathname.replace(/^\/agent\/?/, "") || ORIGINAL_ENTRY;
+async function handleRoomPath(
+  roomPath: { kind: "rooms" | "watch"; roomId: string; rest: string },
+  request: IncomingMessage,
+  response: ServerResponse,
+  url: URL
+) {
+  const roomId = roomPath.roomId;
+  getRoomState(roomId);
+
+  if (request.method === "GET" && roomPath.rest === "/") {
+    sendJson(response, 200, { ...getBridgeState(roomId), role: roomPath.kind === "watch" ? "spectator" : "player" });
+    return true;
+  }
+
+  if (request.method === "GET" && roomPath.kind === "rooms" && roomPath.rest === "/events") {
+    subscribeRoomEvents(roomId, request, response);
+    return true;
+  }
+
+  if (request.method === "GET" && roomPath.kind === "rooms" && roomPath.rest === "/snapshot") {
+    sendJson(response, 200, getBridgeState(roomId));
+    return true;
+  }
+
+  if (request.method === "POST" && roomPath.kind === "rooms" && roomPath.rest === "/snapshot") {
+    const body = await readJsonBody<{ tinyState?: Record<string, unknown>; event?: unknown }>(request);
+    const room = getRoomState(roomId);
+    if (isRecord(body.tinyState)) room.tinyState = body.tinyState;
+    touchRoom(roomId);
+    emitRoomEvent(roomId, "snapshot", { room: serializeRoom(roomId), event: body.event ?? null });
+    sendJson(response, 200, getBridgeState(roomId));
+    return true;
+  }
+
+  if (request.method === "GET" && roomPath.kind === "rooms" && roomPath.rest === "/export") {
+    sendJson(response, 200, getRoomExport(roomId));
+    return true;
+  }
+
+  if (request.method === "POST" && roomPath.kind === "rooms" && roomPath.rest === "/import") {
+    const body = await readJsonBody<unknown>(request);
+    importRoomExport(roomId, body);
+    sendJson(response, 200, getBridgeState(roomId));
+    return true;
+  }
+
+  if (request.method === "GET" && roomPath.kind === "rooms" && roomPath.rest === "/save") {
+    sendJson(response, 200, {
+      ok: true,
+      room: serializeRoom(roomId),
+      saves: Object.fromEntries(PLAYER_IDS.map((playerId) => [playerId, getPlayerState(roomId, playerId).latestReport?.save ?? null]))
+    });
+    return true;
+  }
+
+  if (request.method === "POST" && roomPath.kind === "rooms" && roomPath.rest === "/save/import") {
+    const body = await readJsonBody<{ player?: string; save?: PlayerBrowserSave }>(request);
+    const playerId = normalizePlayerId(body.player ?? url.searchParams.get("player") ?? "right");
+    const save = normalizeBrowserSave(body.save);
+    const result = await queueCommand(roomId, playerId, { id: randomUUID(), type: "import-save", save });
+    sendJson(response, 200, { ok: result.ok, room: serializeRoom(roomId), player: getPlayerMeta(roomId, playerId), result });
+    return true;
+  }
+
+  if (request.method === "POST" && roomPath.kind === "rooms" && roomPath.rest === "/events") {
+    const body = await readJsonBody<{ type?: string; payload?: unknown }>(request);
+    const event = emitRoomEvent(roomId, normalizeEventType(body.type), body.payload ?? null);
+    sendJson(response, 200, { ok: true, room: serializeRoom(roomId), event });
+    return true;
+  }
+
+  if (request.method === "GET" && roomPath.kind === "rooms" && roomPath.rest.startsWith("/players/")) {
+    await proxyPlayerAsset(url, response, undefined, roomId);
+    return true;
+  }
+
+  if (request.method === "GET" && roomPath.kind === "rooms" && roomPath.rest.startsWith("/agent/")) {
+    await proxyPlayerAsset(url, response, "right", roomId);
+    return true;
+  }
+
+  return false;
+}
+
+async function proxyPlayerAsset(url: URL, response: ServerResponse, fallbackPlayer?: PlayerId, fallbackRoomId = DEFAULT_ROOM_ID) {
+  const roomPath = parseRoomPath(url.pathname);
+  const assetPath = roomPath?.rest ?? url.pathname;
+  const roomId = roomPath ? roomPath.roomId : fallbackRoomId;
+  const match = fallbackPlayer ? null : assetPath.match(/^\/players\/([^/]+)\/?(.*)$/);
+  const playerId = fallbackPlayer ?? normalizePlayerId(match?.[1] ?? "right");
+  const relativePath = fallbackPlayer ? assetPath.replace(/^\/agent\/?/, "") || ORIGINAL_ENTRY : match?.[2] || ORIGINAL_ENTRY;
   const upstreamUrl = new URL(relativePath, ORIGINAL_BASE);
   upstreamUrl.search = url.search;
+  upstreamUrl.searchParams.delete("room");
 
   const upstream = await fetch(upstreamUrl);
   const contentType = upstream.headers.get("content-type") ?? inferContentType(relativePath);
@@ -474,7 +960,7 @@ async function proxyAgentAsset(url: URL, response: ServerResponse) {
       "Content-Type": contentType,
       "Cache-Control": "no-store"
     });
-    response.end(injectAgentController(html));
+    response.end(injectPlayerController(html, roomId, playerId));
     return;
   }
 
@@ -486,33 +972,295 @@ async function proxyAgentAsset(url: URL, response: ServerResponse) {
   response.end(body);
 }
 
-function injectAgentController(html: string) {
-  const script = `<script>${AGENT_CONTROLLER_SCRIPT}</script>`;
-  if (html.includes("</body>")) {
-    return html.replace("</body>", `${script}</body>`);
+function injectPlayerController(html: string, roomId: string, playerId: PlayerId) {
+  const storageScript = `<script>${createStoragePartitionScript(roomId, playerId)}</script>`;
+  const controllerScript = `<script>${createPlayerControllerScript(roomId, playerId)}</script>`;
+  const withStorage = html.replace(/<head([^>]*)>/i, (match) => `${match}${storageScript}`);
+  const htmlWithStorage = withStorage === html ? `${storageScript}${html}` : withStorage;
+
+  if (/<\/body>/i.test(htmlWithStorage)) {
+    return htmlWithStorage.replace(/<\/body>/i, () => `${controllerScript}</body>`);
   }
-  return `${html}${script}`;
+
+  return `${htmlWithStorage}${controllerScript}`;
 }
 
-function getBridgeState() {
-  const agentConnected = latestReport !== null && Date.now() - latestReport.at < REPORT_STALE_MS;
+function createStoragePartitionScript(roomId: string, playerId: PlayerId) {
+  return String.raw`
+(() => {
+  const ROOM_ID = ${JSON.stringify(roomId)};
+  const PLAYER_ID = ${JSON.stringify(playerId)};
+  const PREFIX = "paperclip-battler:" + (ROOM_ID === "local" ? "" : ROOM_ID + ":") + PLAYER_ID + ":";
+
+  const partition = (storage) => {
+    const partitionKeys = () => {
+      const keys = [];
+      for (let index = 0; index < storage.length; index += 1) {
+        const key = storage.key(index);
+        if (key && key.startsWith(PREFIX)) keys.push(key.slice(PREFIX.length));
+      }
+      return keys;
+    };
+
+    return {
+      get length() {
+        return partitionKeys().length;
+      },
+      key(index) {
+        return partitionKeys()[index] ?? null;
+      },
+      getItem(key) {
+        return storage.getItem(PREFIX + String(key));
+      },
+      setItem(key, value) {
+        storage.setItem(PREFIX + String(key), String(value));
+      },
+      removeItem(key) {
+        storage.removeItem(PREFIX + String(key));
+      },
+      clear() {
+        for (const key of partitionKeys()) storage.removeItem(PREFIX + key);
+      }
+    };
+  };
+
+  try {
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      value: partition(window.localStorage)
+    });
+    Object.defineProperty(window, "sessionStorage", {
+      configurable: true,
+      value: partition(window.sessionStorage)
+    });
+  } catch {
+    // The original game still works with shared browser storage if this browser refuses the override.
+  }
+})();
+`;
+}
+
+function createPlayerControllerScript(roomId: string, playerId: PlayerId) {
+  return AGENT_CONTROLLER_SCRIPT
+    .replace("__PAPERCLIP_ROOM_ID__", JSON.stringify(roomId))
+    .replace("__PAPERCLIP_PLAYER_ID__", JSON.stringify(playerId));
+}
+
+function createPlayerStates() {
+  return new Map<PlayerId, PlayerState>(
+    PLAYER_IDS.map((playerId) => [
+      playerId,
+      {
+        mode: DEFAULT_PLAYER_MODES[playerId],
+        ready: false,
+        latestReport: null,
+        pendingCommand: null,
+        claim: null
+      }
+    ])
+  );
+}
+
+function createRoomState(roomId: string, title?: string): RoomState {
+  const now = Date.now();
+  return {
+    id: roomId,
+    title: normalizeRoomTitle(title, roomId),
+    createdAt: now,
+    updatedAt: now,
+    tinyState: {},
+    playerStates: createPlayerStates(),
+    events: [],
+    nextEventId: 1,
+    sseClients: new Set()
+  };
+}
+
+function getRoomState(roomId: string, title?: string) {
+  const normalized = normalizeRoomId(roomId);
+  let room = rooms.get(normalized);
+  if (!room) {
+    room = createRoomState(normalized, title);
+    rooms.set(normalized, room);
+  }
+  return room;
+}
+
+function touchRoom(roomId: string) {
+  getRoomState(roomId).updatedAt = Date.now();
+}
+
+function getBridgeState(roomId = DEFAULT_ROOM_ID) {
+  const room = getRoomState(roomId);
+  const players = Object.fromEntries(PLAYER_IDS.map((playerId) => [playerId, getPlayerBridgeState(roomId, playerId)]));
+  const right = players.right;
   return {
     ok: true,
+    room: serializeRoom(roomId),
+    roomId,
+    roomUrl: `http://127.0.0.1:${BRIDGE_PORT}/rooms/${room.id}`,
+    watchUrl: `http://127.0.0.1:${BRIDGE_PORT}/watch/${room.id}`,
     bridgeUrl: `http://127.0.0.1:${BRIDGE_PORT}`,
-    agentUrl: `http://127.0.0.1:${BRIDGE_PORT}/agent/${ORIGINAL_ENTRY}`,
+    agentUrl: `http://127.0.0.1:${BRIDGE_PORT}/rooms/${room.id}/agent/${ORIGINAL_ENTRY}`,
+    playerUrls: {
+      left: `http://127.0.0.1:${BRIDGE_PORT}/rooms/${room.id}/players/left/${ORIGINAL_ENTRY}`,
+      right: `http://127.0.0.1:${BRIDGE_PORT}/rooms/${room.id}/players/right/${ORIGINAL_ENTRY}`
+    },
     instructionMode,
     instructionLabel: instructionModeLabel(instructionMode),
-    agentConnected,
-    lastReportAt: latestReport?.at ?? null,
-    buttonCount: latestReport?.buttons.filter((button) => button.visible).length ?? 0,
-    pendingCommand: pendingCommand
+    allPlayersReady: allPlayersReady(roomId),
+    players,
+    agentConnected: right.connected,
+    lastReportAt: right.lastReportAt,
+    buttonCount: right.buttonCount,
+    pendingCommand: right.pendingCommand,
+    report: right.report
+  };
+}
+
+function serializeRoom(roomId: string) {
+  const room = getRoomState(roomId);
+  return {
+    id: room.id,
+    title: room.title,
+    createdAt: room.createdAt,
+    updatedAt: room.updatedAt,
+    tinyState: room.tinyState,
+    roomUrl: `http://127.0.0.1:${BRIDGE_PORT}/rooms/${room.id}`,
+    watchUrl: `http://127.0.0.1:${BRIDGE_PORT}/watch/${room.id}`,
+    spectatorCount: room.sseClients.size,
+    eventCount: room.events.length,
+    snapshotCount: PLAYER_IDS.filter((playerId) => Boolean(getPlayerState(roomId, playerId).latestReport)).length,
+    slots: Object.fromEntries(
+      PLAYER_IDS.map((playerId) => {
+        const player = getPlayerMeta(roomId, playerId);
+        const report = getPlayerState(roomId, playerId).latestReport;
+        return [
+          playerId,
+          {
+            player: playerId,
+            label: player.label,
+            mode: player.mode,
+            ready: player.ready,
+            connected: isFreshReport(report),
+            lastSeenAt: report?.at ?? null,
+            claim: player.claim
+          }
+        ];
+      })
+    )
+  };
+}
+
+function getRoomExport(roomId: string) {
+  const room = getRoomState(roomId);
+  return {
+    ok: true,
+    version: 1,
+    exportedAt: Date.now(),
+    room: serializeRoom(roomId),
+    tinyState: room.tinyState,
+    players: Object.fromEntries(
+      PLAYER_IDS.map((playerId) => {
+        const state = getPlayerState(roomId, playerId);
+        return [
+          playerId,
+          {
+            meta: getPlayerMeta(roomId, playerId),
+            report: summarizeReport(state.latestReport),
+            save: state.latestReport?.save ?? null
+          }
+        ];
+      })
+    ),
+    events: room.events
+  };
+}
+
+function importRoomExport(roomId: string, value: unknown) {
+  const room = getRoomState(roomId);
+  if (!isRecord(value)) throw new Error("Room import must be a JSON object.");
+
+  const importedRoom = isRecord(value.room) ? value.room : null;
+  const importedTitle = typeof importedRoom?.title === "string" ? importedRoom.title : undefined;
+  if (importedTitle) room.title = normalizeRoomTitle(importedTitle, roomId);
+
+  const tinyState = isRecord(value.tinyState) ? value.tinyState : isRecord(importedRoom?.tinyState) ? importedRoom.tinyState : null;
+  if (tinyState) room.tinyState = tinyState;
+
+  if (isRecord(value.players)) {
+    for (const playerId of PLAYER_IDS) {
+      const importedPlayer = isRecord(value.players[playerId]) ? value.players[playerId] : null;
+      const importedMeta = isRecord(importedPlayer?.meta) ? importedPlayer.meta : importedPlayer;
+      const state = getPlayerState(roomId, playerId);
+      if (isPlayerMode(importedMeta?.mode)) state.mode = importedMeta.mode;
+      if (typeof importedMeta?.ready === "boolean") state.ready = importedMeta.ready;
+      if (isRecord(importedPlayer?.report)) state.latestReport = normalizeReport(importedPlayer.report as AgentReport);
+    }
+  }
+
+  touchRoom(roomId);
+  emitRoomEvent(roomId, "room", { room: serializeRoom(roomId) });
+}
+
+function getPlayerBridgeState(roomId: string, playerId: PlayerId) {
+  const state = getPlayerState(roomId, playerId);
+  const connected = isFreshReport(state.latestReport);
+  return {
+    ...getPlayerMeta(roomId, playerId),
+    connected,
+    agentConnected: connected,
+    lastReportAt: state.latestReport?.at ?? null,
+    buttonCount: state.latestReport?.buttons.filter((button) => button.visible).length ?? 0,
+    pendingCommand: state.pendingCommand
       ? {
-          id: pendingCommand.id,
-          type: pendingCommand.type
+          id: state.pendingCommand.id,
+          type: state.pendingCommand.type
         }
       : null,
-    report: summarizeReport(latestReport)
+    report: summarizeReport(state.latestReport)
   };
+}
+
+function getPlayerMeta(roomId: string, playerId: PlayerId) {
+  const state = getPlayerState(roomId, playerId);
+  return {
+    id: playerId,
+    label: PLAYER_LABELS[playerId],
+    mode: state.mode,
+    ready: state.ready,
+    agentEnabled: agentCanAct(state.mode),
+    userClicksAllowed: userClicksAllowed(state.mode),
+    claim: serializeClaim(getActiveClaim(roomId, playerId), false)
+  };
+}
+
+function getPlayerModes(roomId: string) {
+  return Object.fromEntries(PLAYER_IDS.map((playerId) => [playerId, getPlayerMeta(roomId, playerId)]));
+}
+
+function allPlayersReady(roomId: string) {
+  return PLAYER_IDS.every((playerId) => getPlayerState(roomId, playerId).ready);
+}
+
+function readyGateMessage(roomId: string, playerId: PlayerId) {
+  const player = getPlayerState(roomId, playerId);
+  const waitingOn = PLAYER_IDS.filter((candidateId) => !getPlayerState(roomId, candidateId).ready);
+
+  if (!player.ready) {
+    const others = waitingOn.filter((candidateId) => candidateId !== playerId);
+    const suffix = others.length ? ` Then wait for ${formatPlayerList(others)} to be ready.` : "";
+    return `You need to be ready before taking actions. Mark ${PLAYER_LABELS[playerId]} ready with set_agent_player_ready or the Ready button.${suffix}`;
+  }
+
+  return `Waiting for ${formatPlayerList(waitingOn)} to be ready before actions can run.`;
+}
+
+function formatPlayerList(playerIds: PlayerId[]) {
+  const labels = playerIds.map((playerId) => PLAYER_LABELS[playerId]);
+  if (labels.length === 0) return "both players";
+  if (labels.length === 1) return labels[0];
+  return `${labels.slice(0, -1).join(", ")} and ${labels[labels.length - 1]}`;
 }
 
 function summarizeReport(report: AgentReport | null) {
@@ -527,25 +1275,168 @@ function summarizeReport(report: AgentReport | null) {
   };
 }
 
-function getFreshReport() {
-  if (!latestReport || Date.now() - latestReport.at > REPORT_STALE_MS) {
-    throw new Error(
-      `No live agent pane is connected. Open the app and keep the Agent pane loaded at http://127.0.0.1:5174/.`
-    );
-  }
-  return latestReport;
+function getPlayerState(roomId: string, playerId: PlayerId) {
+  const state = getRoomState(roomId).playerStates.get(playerId);
+  if (!state) throw new Error(`Unknown player: ${playerId}.`);
+  return state;
 }
 
-function resolveButton({
-  buttonId,
-  index,
-  text
-}: {
+function getActiveClaim(roomId: string, playerId: PlayerId) {
+  const state = getPlayerState(roomId, playerId);
+  clearExpiredClaim(state);
+  return state.claim;
+}
+
+function maybeEnsurePlayerClaim(
+  roomId: string,
+  playerId: PlayerId,
+  options: {
+    claimToken?: string;
+    controller?: string;
+    source: PlayerClaim["source"];
+  }
+) {
+  const state = getPlayerState(roomId, playerId);
+  if (!agentCanAct(state.mode) || !isFreshReport(state.latestReport)) return null;
+  return ensurePlayerClaim(roomId, playerId, options);
+}
+
+function ensurePlayerClaim(
+  roomId: string,
+  playerId: PlayerId,
+  {
+    claimToken,
+    controller,
+    source
+  }: {
+    claimToken?: string;
+    controller?: string;
+    source: PlayerClaim["source"];
+  }
+) {
+  const state = getPlayerState(roomId, playerId);
+  if (!agentCanAct(state.mode)) {
+    throw new Error(`${PLAYER_LABELS[playerId]} is human-only. Set it to Agent or Both before using MCP commands.`);
+  }
+
+  clearExpiredClaim(state);
+
+  if (!state.claim) {
+    state.claim = createPlayerClaim(controller, source);
+    return state.claim;
+  }
+
+  if (claimToken && claimToken === state.claim.token) {
+    touchPlayerClaim(state.claim);
+    return state.claim;
+  }
+
+  const owner = state.claim.label || "another controller";
+  throw new Error(
+    `${PLAYER_LABELS[playerId]} is already claimed by ${owner}. Use the matching claimToken or release the claim in the UI.`
+  );
+}
+
+function releasePlayerClaim(roomId: string, playerId: PlayerId, claimToken?: string, force = false) {
+  const state = getPlayerState(roomId, playerId);
+  clearExpiredClaim(state);
+  if (!state.claim) return;
+  if (!force && (!claimToken || claimToken !== state.claim.token)) {
+    throw new Error(`Cannot release ${PLAYER_LABELS[playerId]} without the matching claimToken.`);
+  }
+  state.claim = null;
+}
+
+function assertReadyChangeAllowed(roomId: string, playerId: PlayerId, claimToken?: string, force = false) {
+  const state = getPlayerState(roomId, playerId);
+  clearExpiredClaim(state);
+  if (!state.claim || force) return;
+  if (claimToken === state.claim.token) {
+    touchPlayerClaim(state.claim);
+    return;
+  }
+  throw new Error(`Cannot change ${PLAYER_LABELS[playerId]} ready state without the matching claimToken.`);
+}
+
+function assertActionReady(roomId: string, playerId: PlayerId) {
+  if (!allPlayersReady(roomId)) {
+    throw new Error(readyGateMessage(roomId, playerId));
+  }
+}
+
+function createPlayerClaim(controller: string | undefined, source: PlayerClaim["source"]): PlayerClaim {
+  const now = Date.now();
+  return {
+    token: randomUUID(),
+    label: normalizeClaimLabel(controller, source),
+    source,
+    claimedAt: now,
+    lastSeenAt: now,
+    expiresAt: now + CLAIM_TTL_MS
+  };
+}
+
+function touchPlayerClaim(claim: PlayerClaim) {
+  const now = Date.now();
+  claim.lastSeenAt = now;
+  claim.expiresAt = now + CLAIM_TTL_MS;
+}
+
+function clearExpiredClaim(state: PlayerState) {
+  if (state.claim && state.claim.expiresAt <= Date.now()) {
+    state.claim = null;
+  }
+}
+
+function normalizeClaimLabel(controller: string | undefined, source: PlayerClaim["source"]) {
+  const label = controller?.trim().replace(/\s+/g, " ");
+  if (label) return label.slice(0, 60);
+  return source === "mcp" ? "MCP controller" : "HTTP controller";
+}
+
+function serializeClaim(claim: PlayerClaim | null, revealToken: boolean) {
+  if (!claim) return null;
+  const now = Date.now();
+  return {
+    token: revealToken ? claim.token : undefined,
+    tokenSuffix: claim.token.slice(-8),
+    label: claim.label,
+    source: claim.source,
+    claimedAt: claim.claimedAt,
+    lastSeenAt: claim.lastSeenAt,
+    expiresAt: claim.expiresAt,
+    ttlMs: Math.max(0, claim.expiresAt - now)
+  };
+}
+
+function isFreshReport(report: AgentReport | null) {
+  return Boolean(report && Date.now() - report.at <= REPORT_STALE_MS);
+}
+
+function getFreshReport(roomId: string, playerId: PlayerId) {
+  const state = getPlayerState(roomId, playerId);
+  if (!isFreshReport(state.latestReport)) {
+    throw new Error(
+      `No live ${PLAYER_LABELS[playerId]} pane is connected in room ${roomId}. Open the app and keep that pane loaded.`
+    );
+  }
+  return state.latestReport as AgentReport;
+}
+
+function resolveButton(
+  roomId: string,
+  playerId: PlayerId,
+  {
+    buttonId,
+    index,
+    text
+  }: {
   buttonId?: string;
   index?: number;
   text?: string;
-}) {
-  const report = getFreshReport();
+  }
+) {
+  const report = getFreshReport(roomId, playerId);
   const available = report.buttons.filter((button) => button.visible);
   const normalizedText = text?.trim().toLowerCase();
 
@@ -561,22 +1452,26 @@ function resolveButton({
       : undefined);
 
   if (!button) {
-    throw new Error("Could not find that button in the live agent pane.");
+    throw new Error(`Could not find that button in the live ${PLAYER_LABELS[playerId]} pane.`);
   }
 
   return button;
 }
 
-function resolveControl({
-  controlId,
-  index,
-  label
-}: {
+function resolveControl(
+  roomId: string,
+  playerId: PlayerId,
+  {
+    controlId,
+    index,
+    label
+  }: {
   controlId?: string;
   index?: number;
   label?: string;
-}) {
-  const report = getFreshReport();
+  }
+) {
+  const report = getFreshReport(roomId, playerId);
   const available = report.controls.filter((control) => control.visible);
   const normalizedLabel = label?.trim().toLowerCase();
 
@@ -593,28 +1488,36 @@ function resolveControl({
       : undefined);
 
   if (!control) {
-    throw new Error("Could not find that control in the live agent pane.");
+    throw new Error(`Could not find that control in the live ${PLAYER_LABELS[playerId]} pane.`);
   }
 
   return control;
 }
 
-function queueCommand(command: AgentCommand): Promise<AgentCommandResult> {
-  getFreshReport();
+function queueCommand(roomId: string, playerId: PlayerId, command: AgentCommand): Promise<AgentCommandResult> {
+  const state = getPlayerState(roomId, playerId);
 
-  if (pendingCommand) {
-    throw new Error("Another agent command is already pending.");
+  if (!agentCanAct(state.mode)) {
+    throw new Error(`${PLAYER_LABELS[playerId]} is human-only. Set it to Agent or Both before using MCP commands.`);
   }
 
-  pendingCommand = command;
+  if (command.type !== "reset" && command.type !== "import-save" && !allPlayersReady(roomId)) {
+    assertActionReady(roomId, playerId);
+  }
+
+  if (state.pendingCommand) {
+    throw new Error(`Another ${PLAYER_LABELS[playerId]} command is already pending.`);
+  }
+
+  state.pendingCommand = command;
 
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       commandWaiters.delete(command.id);
-      if (pendingCommand?.id === command.id) {
-        pendingCommand = null;
+      if (state.pendingCommand?.id === command.id) {
+        state.pendingCommand = null;
       }
-      reject(new Error("Timed out waiting for the agent pane to run the command."));
+      reject(new Error(`Timed out waiting for the ${PLAYER_LABELS[playerId]} pane to run the command.`));
     }, COMMAND_TIMEOUT_MS);
 
     commandWaiters.set(command.id, (result) => {
@@ -644,7 +1547,8 @@ function normalizeReport(report: AgentReport): AgentReport {
     title: String(report.title ?? ""),
     buttons: Array.isArray(report.buttons) ? report.buttons : [],
     controls: Array.isArray(report.controls) ? report.controls : [],
-    visibleText: String(report.visibleText ?? "").slice(0, 10_000)
+    visibleText: String(report.visibleText ?? "").slice(0, 10_000),
+    save: report.save ? normalizeBrowserSave(report.save) : undefined
   };
 }
 
@@ -676,7 +1580,7 @@ function readJsonBody<T>(request: IncomingMessage): Promise<T> {
     request.setEncoding("utf8");
     request.on("data", (chunk) => {
       body += chunk;
-      if (body.length > 1_000_000) {
+      if (body.length > MAX_JSON_BODY_SIZE) {
         reject(new Error("Request body is too large."));
         request.destroy();
       }
@@ -705,10 +1609,140 @@ function inferContentType(path: string) {
   return "application/octet-stream";
 }
 
+function parseRoomPath(pathname: string) {
+  const match = pathname.match(/^\/(rooms|watch)\/([^/]+)(?:\/(.*))?$/);
+  if (!match) return null;
+  return {
+    kind: match[1] as "rooms" | "watch",
+    roomId: normalizeRoomId(match[2]),
+    rest: match[3] ? `/${match[3]}` : "/"
+  };
+}
+
+function resolveUrlRoomId(url: URL) {
+  return normalizeRoomId(url.searchParams.get("room") ?? DEFAULT_ROOM_ID);
+}
+
+function resolveBodyRoomId(url: URL, body: { room?: unknown }) {
+  return normalizeRoomId(body.room ?? url.searchParams.get("room") ?? DEFAULT_ROOM_ID);
+}
+
+function normalizeRoomId(value: unknown) {
+  const normalized = String(value ?? DEFAULT_ROOM_ID)
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, "");
+  if (!normalized) return DEFAULT_ROOM_ID;
+  if (normalized.length > 32) throw new Error("Room id must be 32 characters or fewer.");
+  return normalized;
+}
+
+function createShortRoomId() {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const roomId = randomUUID().replace(/-/g, "").slice(0, ROOM_ID_LENGTH);
+    if (!rooms.has(roomId)) return roomId;
+  }
+  return randomUUID().replace(/-/g, "").slice(0, 12);
+}
+
+function normalizeRoomTitle(title: unknown, roomId: string) {
+  const value = typeof title === "string" ? title.trim().replace(/\s+/g, " ") : "";
+  return value ? value.slice(0, 80) : roomId === DEFAULT_ROOM_ID ? "Local Room" : `Room ${roomId}`;
+}
+
+function normalizeEventType(value: unknown) {
+  const normalized = typeof value === "string" ? value.trim().toLowerCase().replace(/[^a-z0-9_-]/g, "-") : "";
+  return normalized || "message";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function isPlayerMode(value: unknown): value is PlayerMode {
+  return typeof value === "string" && PLAYER_MODES.includes(value as PlayerMode);
+}
+
+function normalizeBrowserSave(value: unknown): PlayerBrowserSave {
+  const source = isRecord(value) ? value : {};
+  return {
+    localStorage: normalizeStringRecord(source.localStorage),
+    sessionStorage: normalizeStringRecord(source.sessionStorage)
+  };
+}
+
+function normalizeStringRecord(value: unknown) {
+  if (!isRecord(value)) return {};
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, String(item)]));
+}
+
+function subscribeRoomEvents(roomId: string, request: IncomingMessage, response: ServerResponse) {
+  const room = getRoomState(roomId);
+  response.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive"
+  });
+  response.write(`event: snapshot\ndata: ${JSON.stringify({ room: serializeRoom(roomId), state: getBridgeState(roomId) })}\n\n`);
+  room.sseClients.add(response);
+  touchRoom(roomId);
+  request.on("close", () => {
+    room.sseClients.delete(response);
+    touchRoom(roomId);
+  });
+}
+
+function emitRoomEvent(roomId: string, type: string, payload: unknown) {
+  const room = getRoomState(roomId);
+  const event: RoomEvent = {
+    id: room.nextEventId,
+    roomId,
+    type,
+    at: Date.now(),
+    payload
+  };
+  room.nextEventId += 1;
+  room.updatedAt = event.at;
+  room.events.push(event);
+  if (room.events.length > ROOM_EVENT_HISTORY_LIMIT) room.events.splice(0, room.events.length - ROOM_EVENT_HISTORY_LIMIT);
+
+  const message = `id: ${event.id}\nevent: ${type}\ndata: ${JSON.stringify(event)}\n\n`;
+  for (const client of Array.from(room.sseClients)) {
+    try {
+      client.write(message);
+    } catch {
+      room.sseClients.delete(client);
+    }
+  }
+  return event;
+}
+
 function normalizeInstructionMode(value: unknown): InstructionMode {
   return typeof value === "string" && INSTRUCTION_MODES.includes(value as InstructionMode)
     ? (value as InstructionMode)
     : "none";
+}
+
+function normalizePlayerId(value: unknown): PlayerId {
+  const normalized = String(value ?? "right").trim().toLowerCase();
+  if (normalized === "left" || normalized === "player" || normalized === "p1" || normalized === "1") return "left";
+  if (normalized === "right" || normalized === "agent" || normalized === "p2" || normalized === "2") return "right";
+  throw new Error("Player must be left/player/1 or right/agent/2.");
+}
+
+function normalizePlayerMode(value: unknown): PlayerMode {
+  if (typeof value === "string" && PLAYER_MODES.includes(value as PlayerMode)) {
+    return value as PlayerMode;
+  }
+  throw new Error("Player mode must be human, agent, or both.");
+}
+
+function agentCanAct(mode: PlayerMode) {
+  return mode === "agent" || mode === "both";
+}
+
+function userClicksAllowed(mode: PlayerMode) {
+  return mode === "human" || mode === "both";
 }
 
 function instructionModeLabel(mode: InstructionMode) {
@@ -721,8 +1755,8 @@ function getPaulsAgentInstructions() {
   return readInstructionFile(PAULS_INSTRUCTION_PATHS, [
     "# Paul's Agent AI Instructions",
     "",
-    "Play only the Agent pane. Read the live agent state, act through the exposed buttons and controls,",
-    "balance production with demand and wire, report compact status updates, and never reset unless Paul asks."
+    "Play only an Agent or Both pane. Claim the target player, preserve the claim token, act through",
+    "the exposed buttons and controls after both players are ready, report compact status updates, and never reset unless Paul asks."
   ]);
 }
 
@@ -730,8 +1764,8 @@ function getCodexAgentInstructions() {
   return readInstructionFile(CODEX_INSTRUCTION_PATHS, [
     "# Codex Agent AI Instructions",
     "",
-    "Use this optional self-playbook when it helps. Observe the live agent state, act in short verified",
-    "bursts, improve the bridge when controls are missing, and update the playbook when tactics change."
+    "Use this optional self-playbook when it helps. Claim a target player, observe the live state, act in",
+    "short verified bursts after both players are ready, improve the bridge when controls are missing, and update the playbook when tactics change."
   ]);
 }
 
@@ -742,9 +1776,32 @@ function readInstructionFile(paths: string[], fallbackLines: string[]) {
 
 const AGENT_CONTROLLER_SCRIPT = String.raw`
 (() => {
-  const REPORT_URL = "/agent-control/report";
-  const COMMAND_URL = "/agent-control/next-command";
-  const RESULT_URL = "/agent-control/result";
+  const ROOM_ID = __PAPERCLIP_ROOM_ID__;
+  const PLAYER_ID = __PAPERCLIP_PLAYER_ID__;
+  const ROOM_QUERY = "room=" + encodeURIComponent(ROOM_ID) + "&player=" + encodeURIComponent(PLAYER_ID);
+  const CONFIG_URL = "/player-control/config?" + ROOM_QUERY;
+  const REPORT_URL = "/player-control/report?" + ROOM_QUERY;
+  const COMMAND_URL = "/player-control/next-command?" + ROOM_QUERY;
+  const RESULT_URL = "/player-control/result?" + ROOM_QUERY;
+  const INTERACTIVE_SELECTOR =
+    'button,input:not([type="hidden"]),select,textarea,a[onclick],[role="button"]';
+  const SHIELD_EVENTS = [
+    "pointerdown",
+    "pointerup",
+    "mousedown",
+    "mouseup",
+    "click",
+    "dblclick",
+    "auxclick",
+    "contextmenu",
+    "touchstart",
+    "touchend"
+  ];
+
+  let playerMode = "human";
+  let playerReady = false;
+  let allPlayersReady = false;
+  let inputShield = null;
 
   const cssEscape = (value) => {
     if (window.CSS && typeof window.CSS.escape === "function") return window.CSS.escape(value);
@@ -752,6 +1809,72 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   };
 
   const normalizeText = (value) => String(value || "").replace(/\s+/g, " ").trim();
+  const agentCanAct = () => playerMode === "agent" || playerMode === "both";
+  const userInputLocked = () => !allPlayersReady || playerMode === "agent";
+
+  const installStyles = () => {
+    const style = document.createElement("style");
+    style.textContent = [
+      'html[data-paperclip-battler-input-locked="true"],',
+      'html[data-paperclip-battler-input-locked="true"] body {',
+      "cursor: not-allowed !important;",
+      "}",
+      "#paperclip-battler-input-shield {",
+      "position: fixed !important;",
+      "inset: 0 !important;",
+      "z-index: 2147483647 !important;",
+      "display: none !important;",
+      "cursor: not-allowed !important;",
+      "background: rgba(255, 255, 255, 0) !important;",
+      "pointer-events: none !important;",
+      "touch-action: none !important;",
+      "}",
+      'html[data-paperclip-battler-input-locked="true"] #paperclip-battler-input-shield {',
+      "display: block !important;",
+      "pointer-events: auto !important;",
+      "}",
+      'html[data-paperclip-battler-input-locked="true"] button:not(:disabled),',
+      'html[data-paperclip-battler-input-locked="true"] input:not([type="hidden"]):not(:disabled),',
+      'html[data-paperclip-battler-input-locked="true"] select:not(:disabled),',
+      'html[data-paperclip-battler-input-locked="true"] textarea:not(:disabled),',
+      'html[data-paperclip-battler-input-locked="true"] a[onclick],',
+      'html[data-paperclip-battler-input-locked="true"] [role="button"] {',
+      "cursor: not-allowed !important;",
+      "pointer-events: none !important;",
+      "}",
+      'html[data-paperclip-battler-input-locked="true"] [data-paperclip-battler-user-locked="true"]:hover {',
+      "outline: 1px dashed #9b6a16 !important;",
+      "outline-offset: 2px !important;",
+      "}",
+      ".paperclip-battler-mcp-press {",
+      "transform: translateY(1px) scale(0.98) !important;",
+      "filter: brightness(0.92) saturate(1.2) !important;",
+      "outline: 2px solid #2f74d0 !important;",
+      "outline-offset: 1px !important;",
+      "transition: transform 90ms ease, filter 90ms ease !important;",
+      "}",
+      ".paperclip-battler-input-blocked {",
+      "animation: paperclip-battler-blocked 180ms ease-out;",
+      "}",
+      "@keyframes paperclip-battler-blocked {",
+      "0%, 100% { filter: none; }",
+      "35% { filter: sepia(0.5) saturate(1.4) brightness(1.05); }",
+      "}"
+    ].join("");
+    document.head.appendChild(style);
+  };
+
+  const ensureInputShield = () => {
+    if (inputShield?.isConnected) return inputShield;
+    inputShield = document.createElement("div");
+    inputShield.id = "paperclip-battler-input-shield";
+    inputShield.setAttribute("aria-hidden", "true");
+    for (const eventName of SHIELD_EVENTS) {
+      inputShield.addEventListener(eventName, blockShieldInput, true);
+    }
+    document.body.appendChild(inputShield);
+    return inputShield;
+  };
 
   const elementSelector = (element, fallbackIndex) => {
     if (element.id) return "#" + cssEscape(element.id);
@@ -804,6 +1927,85 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
         'input:not([type="button"]):not([type="submit"]):not([type="reset"]),select,textarea'
       )
     );
+
+  const setPlayerMode = (mode) => {
+    playerMode = mode === "agent" || mode === "both" ? mode : "human";
+    document.documentElement.dataset.paperclipBattlerMode = playerMode;
+    applyInputLock();
+  };
+
+  const setReadyState = (ready, everyoneReady) => {
+    playerReady = Boolean(ready);
+    allPlayersReady = Boolean(everyoneReady);
+    document.documentElement.dataset.paperclipBattlerReady = String(playerReady);
+    document.documentElement.dataset.paperclipBattlerAllReady = String(allPlayersReady);
+    applyInputLock();
+  };
+
+  const applyInputLock = () => {
+    const locked = userInputLocked();
+    document.documentElement.dataset.paperclipBattlerInputLocked = String(locked);
+    if (document.body) ensureInputShield();
+    for (const element of [...buttonElements(), ...controlElements()]) {
+      if (locked) {
+        element.setAttribute("data-paperclip-battler-user-locked", "true");
+        element.setAttribute("aria-disabled", "true");
+      } else {
+        element.removeAttribute("data-paperclip-battler-user-locked");
+        element.removeAttribute("aria-disabled");
+      }
+    }
+  };
+
+  const refreshConfig = async () => {
+    try {
+      const response = await fetch(CONFIG_URL, { cache: "no-store" });
+      if (!response.ok) throw new Error("config failed");
+      const payload = await response.json();
+      setPlayerMode(payload?.player?.mode);
+      setReadyState(payload?.player?.ready, payload?.allPlayersReady);
+    } catch {
+      // The bridge may be restarting.
+    }
+  };
+
+  const closestInteractive = (target) =>
+    target instanceof Element ? target.closest(INTERACTIVE_SELECTOR) : null;
+
+  const flashBlocked = (element) => {
+    element.classList.remove("paperclip-battler-input-blocked");
+    void element.offsetWidth;
+    element.classList.add("paperclip-battler-input-blocked");
+    window.setTimeout(() => element.classList.remove("paperclip-battler-input-blocked"), 220);
+  };
+
+  const blockTrustedInput = (event) => {
+    if (!userInputLocked() || !event.isTrusted) return;
+    if (event.type === "keydown" && event.key === "Tab") return;
+    const target = closestInteractive(event.target);
+    if (!target) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    flashBlocked(target);
+  };
+
+  const blockShieldInput = (event) => {
+    if (!userInputLocked() || !event.isTrusted) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    if (!inputShield) return;
+    inputShield.classList.remove("paperclip-battler-input-blocked");
+    void inputShield.offsetWidth;
+    inputShield.classList.add("paperclip-battler-input-blocked");
+    window.setTimeout(() => inputShield?.classList.remove("paperclip-battler-input-blocked"), 220);
+  };
+
+  const animateMcpPress = (element) => {
+    element.classList.remove("paperclip-battler-mcp-press");
+    void element.offsetWidth;
+    element.classList.add("paperclip-battler-mcp-press");
+    window.setTimeout(() => element.classList.remove("paperclip-battler-mcp-press"), 170);
+  };
 
   const collectButtons = () =>
     buttonElements().map((element, index) => {
@@ -872,11 +2074,18 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           at: Date.now(),
+          roomId: ROOM_ID,
+          playerId: PLAYER_ID,
+          mode: playerMode,
           url: window.location.href,
           title: document.title,
           buttons: collectButtons(),
           controls: collectControls(),
-          visibleText: normalizeText(document.body?.innerText || "").slice(0, 10000)
+          visibleText: normalizeText(document.body?.innerText || "").slice(0, 10000),
+          save: {
+            localStorage: collectStorage(window.localStorage),
+            sessionStorage: collectStorage(window.sessionStorage)
+          }
         })
       });
     } catch {
@@ -911,16 +2120,38 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     element.dispatchEvent(new Event("change", { bubbles: true }));
   };
 
+  const collectStorage = (storage) => {
+    const values = {};
+    for (let index = 0; index < storage.length; index += 1) {
+      const key = storage.key(index);
+      if (key) values[key] = storage.getItem(key) || "";
+    }
+    return values;
+  };
+
+  const importStorage = (storage, values) => {
+    storage.clear();
+    for (const [key, value] of Object.entries(values || {})) {
+      storage.setItem(key, String(value));
+    }
+  };
+
   const runCommand = async (command) => {
     const result = { id: command.id, ok: true, message: "ok", at: Date.now() };
     try {
+      await refreshConfig();
+      if (!agentCanAct()) throw new Error("This player is not in Agent or Both mode.");
+
       if (command.type === "click") {
+        if (!allPlayersReady) throw new Error(playerReady ? "Waiting for the other player to be ready before actions can run." : "You need to be ready before taking actions.");
         const button = findButton(command);
         if (!button) throw new Error("Button not found.");
         if (button.disabled) throw new Error("Button is disabled.");
+        animateMcpPress(button);
         button.click();
         result.message = "Clicked " + buttonText(button) + ".";
       } else if (command.type === "set-control") {
+        if (!allPlayersReady) throw new Error(playerReady ? "Waiting for the other player to be ready before actions can run." : "You need to be ready before taking actions.");
         const control = findControl(command);
         if (!control) throw new Error("Control not found.");
         if (control.disabled) throw new Error("Control is disabled.");
@@ -935,6 +2166,11 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
         window.localStorage.clear();
         window.sessionStorage.clear();
         result.message = "Resetting page.";
+        window.setTimeout(() => window.location.reload(), 50);
+      } else if (command.type === "import-save") {
+        importStorage(window.localStorage, command.save?.localStorage);
+        importStorage(window.sessionStorage, command.save?.sessionStorage);
+        result.message = "Imported save. Reloading page.";
         window.setTimeout(() => window.location.reload(), 50);
       }
     } catch (error) {
@@ -963,10 +2199,29 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     }
   };
 
+  installStyles();
+  setPlayerMode("human");
+  setReadyState(false, false);
+  refreshConfig();
   report();
   window.addEventListener("load", report);
   window.addEventListener("click", () => window.setTimeout(report, 80), true);
   window.addEventListener("change", () => window.setTimeout(report, 80), true);
+  for (const eventName of [
+    "pointerdown",
+    "mousedown",
+    "mouseup",
+    "click",
+    "dblclick",
+    "touchstart",
+    "touchend",
+    "input",
+    "change",
+    "keydown"
+  ]) {
+    window.addEventListener(eventName, blockTrustedInput, true);
+  }
+  window.setInterval(refreshConfig, 500);
   window.setInterval(report, 1000);
   window.setInterval(poll, 250);
 })();
