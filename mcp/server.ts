@@ -1178,7 +1178,14 @@ function createStoragePartitionScript(roomId: string, playerId: PlayerId, partit
   };
 
   const partition = (storage) => {
+    let cachedKeys = null;
+
+    const invalidateKeys = () => {
+      cachedKeys = null;
+    };
+
     const partitionKeys = () => {
+      if (cachedKeys) return cachedKeys;
       const keys = [];
       for (let index = 0; index < storage.length; index += 1) {
         const key = storage.key(index);
@@ -1188,7 +1195,8 @@ function createStoragePartitionScript(roomId: string, playerId: PlayerId, partit
         if (PARTITION_MODE === "player" && unprefixedKey.startsWith("watch:")) continue;
         keys.push(unprefixedKey);
       }
-      return keys;
+      cachedKeys = keys;
+      return cachedKeys;
     };
 
     return {
@@ -1203,12 +1211,15 @@ function createStoragePartitionScript(roomId: string, playerId: PlayerId, partit
       },
       setItem(key, value) {
         storage.setItem(PREFIX + String(key), String(value));
+        invalidateKeys();
       },
       removeItem(key) {
         storage.removeItem(PREFIX + String(key));
+        invalidateKeys();
       },
       clear() {
         for (const key of partitionKeys()) storage.removeItem(PREFIX + key);
+        invalidateKeys();
       }
     };
   };
@@ -2510,7 +2521,9 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     "touchstart",
     "touchend"
   ];
-  const HEURISTIC_TICK_MS = 125;
+  const HEURISTIC_DECISION_TICK_MS = 250;
+  const HEURISTIC_MANUAL_CLIP_TICK_MS = 125;
+  const REPORT_MIN_INTERVAL_MS = 500;
   const HEURISTIC_SKIP_PATTERN = /reset|restart|import|export|load|save|price|deposit|withdraw|investment/i;
   const HEURISTIC_BUTTON_RULES = [
     { pattern: /buy\s*wire|wire\s*buyer|wire/i, score: 95, cooldownMs: 650 },
@@ -2518,8 +2531,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     { pattern: /processor|memory|operations|op|compute|quantum/i, score: 82, cooldownMs: 1200 },
     { pattern: /clipper|auto\s*clipper|mega\s*clipper/i, score: 78, cooldownMs: 900 },
     { pattern: /marketing|demand/i, score: 64, cooldownMs: 2200 },
-    { pattern: /make\s*paperclip|btnmakepaperclip/i, score: 28, cooldownMs: 125 },
-    { pattern: /paperclip|clip/i, score: 12, cooldownMs: 125 }
+    { pattern: /paperclip|clip/i, score: 12, cooldownMs: 1400 }
   ];
 
   let playerMode = "human";
@@ -2527,6 +2539,9 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   let allPlayersReady = false;
   let inputShield = null;
   let inputTooltip = null;
+  let reportTimer = null;
+  let lastReportAt = 0;
+  let suppressClickReportUntil = 0;
   const heuristicCooldowns = new Map();
 
   const cssEscape = (value) => {
@@ -2846,10 +2861,19 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
       };
     });
 
+  const isManualPaperclipButton = (button) =>
+    normalizeText(button.id).toLowerCase() === "btnmakepaperclip" ||
+    normalizeText(button.text).toLowerCase() === "make paperclip";
+
+  const manualPaperclipElement = () =>
+    document.getElementById("btnMakePaperclip") ||
+    buttonElements().find((element) => normalizeText(buttonText(element)).toLowerCase() === "make paperclip");
+
   const heuristicKey = (button) => normalizeText(button.id || button.text || button.selector).toLowerCase();
 
   const heuristicDecisionForButton = (button) => {
     if (!button.visible || button.disabled) return null;
+    if (isManualPaperclipButton(button)) return null;
     const haystack = [button.id, button.text, button.title, button.value].map(normalizeText).join(" ");
     if (!haystack || HEURISTIC_SKIP_PATTERN.test(haystack)) return null;
 
@@ -2887,7 +2911,16 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     heuristicCooldowns.set(target.key, Date.now() + target.decision.cooldownMs);
     animateMcpPress(element);
     element.click();
-    window.setTimeout(report, 80);
+    scheduleReport(80);
+  };
+
+  const runManualPaperclipTick = () => {
+    if (!heuristicCanAct() || !allPlayersReady) return;
+    const element = manualPaperclipElement();
+    if (!element || !visible(element) || element.disabled) return;
+
+    suppressClickReportUntil = Date.now() + 50;
+    element.click();
   };
 
   const findLabel = (element) => {
@@ -2927,6 +2960,12 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     });
 
   const report = async () => {
+    if (reportTimer) {
+      window.clearTimeout(reportTimer);
+      reportTimer = null;
+    }
+    lastReportAt = Date.now();
+
     try {
       await fetch(REPORT_URL, {
         method: "POST",
@@ -2950,6 +2989,13 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     } catch {
       // The bridge may be restarting.
     }
+  };
+
+  const scheduleReport = (delayMs = 100) => {
+    if (reportTimer) return;
+    const elapsed = Date.now() - lastReportAt;
+    const waitMs = Math.max(delayMs, REPORT_MIN_INTERVAL_MS - elapsed);
+    reportTimer = window.setTimeout(report, Math.max(0, waitMs));
   };
 
   const findButton = (command) => {
@@ -3045,7 +3091,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
         body: JSON.stringify(result)
       });
     } finally {
-      window.setTimeout(report, 100);
+      scheduleReport(100);
     }
   };
 
@@ -3065,8 +3111,11 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   refreshConfig();
   report();
   window.addEventListener("load", report);
-  window.addEventListener("click", () => window.setTimeout(report, 80), true);
-  window.addEventListener("change", () => window.setTimeout(report, 80), true);
+  window.addEventListener("click", () => {
+    if (Date.now() < suppressClickReportUntil) return;
+    scheduleReport(80);
+  }, true);
+  window.addEventListener("change", () => scheduleReport(80), true);
   for (const eventName of [
     "pointerdown",
     "mousedown",
@@ -3084,6 +3133,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   window.setInterval(refreshConfig, 500);
   window.setInterval(report, 1000);
   window.setInterval(poll, 250);
-  window.setInterval(runHeuristicTick, HEURISTIC_TICK_MS);
+  window.setInterval(runHeuristicTick, HEURISTIC_DECISION_TICK_MS);
+  window.setInterval(runManualPaperclipTick, HEURISTIC_MANUAL_CLIP_TICK_MS);
 })();
 `;
