@@ -1164,14 +1164,29 @@ function createStoragePartitionScript(roomId: string, playerId: PlayerId, partit
   const ROOM_ID = ${JSON.stringify(roomId)};
   const PLAYER_ID = ${JSON.stringify(playerId)};
   const PARTITION_MODE = ${JSON.stringify(partitionMode)};
-  const PREFIX = "paperclip-battler:" + (ROOM_ID === "local" ? "" : ROOM_ID + ":") + PLAYER_ID + (PARTITION_MODE === "spectator" ? ":watch:" : ":");
+  const ROOM_PREFIX = "paperclip-battler:" + (ROOM_ID === "local" ? "" : ROOM_ID + ":");
+  const PREFIX = ROOM_PREFIX + (PARTITION_MODE === "spectator" ? "watch:" + PLAYER_ID + ":" : PLAYER_ID + ":");
+  const LEGACY_SPECTATOR_PREFIX = ROOM_PREFIX + PLAYER_ID + ":watch:";
+
+  const removeKeysWithPrefix = (storage, prefix) => {
+    const keys = [];
+    for (let index = 0; index < storage.length; index += 1) {
+      const key = storage.key(index);
+      if (key && key.startsWith(prefix)) keys.push(key);
+    }
+    for (const key of keys) storage.removeItem(key);
+  };
 
   const partition = (storage) => {
     const partitionKeys = () => {
       const keys = [];
       for (let index = 0; index < storage.length; index += 1) {
         const key = storage.key(index);
-        if (key && key.startsWith(PREFIX)) keys.push(key.slice(PREFIX.length));
+        if (!key || !key.startsWith(PREFIX)) continue;
+
+        const unprefixedKey = key.slice(PREFIX.length);
+        if (PARTITION_MODE === "player" && unprefixedKey.startsWith("watch:")) continue;
+        keys.push(unprefixedKey);
       }
       return keys;
     };
@@ -1199,6 +1214,11 @@ function createStoragePartitionScript(roomId: string, playerId: PlayerId, partit
   };
 
   try {
+    if (PARTITION_MODE === "player") {
+      removeKeysWithPrefix(window.localStorage, LEGACY_SPECTATOR_PREFIX);
+      removeKeysWithPrefix(window.sessionStorage, LEGACY_SPECTATOR_PREFIX);
+    }
+
     Object.defineProperty(window, "localStorage", {
       configurable: true,
       value: partition(window.localStorage)
@@ -1998,6 +2018,8 @@ function completeCommand(result: AgentCommandResult) {
 }
 
 function normalizeReport(report: AgentReport): AgentReport {
+  const save = report.save ? sanitizeReportedBrowserSave(normalizeBrowserSave(report.save)) : undefined;
+
   return {
     at: Date.now(),
     url: String(report.url ?? ""),
@@ -2005,7 +2027,7 @@ function normalizeReport(report: AgentReport): AgentReport {
     buttons: Array.isArray(report.buttons) ? report.buttons : [],
     controls: Array.isArray(report.controls) ? report.controls : [],
     visibleText: String(report.visibleText ?? "").slice(0, 10_000),
-    save: report.save ? normalizeBrowserSave(report.save) : undefined
+    save
   };
 }
 
@@ -2341,6 +2363,21 @@ function normalizeBrowserSave(value: unknown): PlayerBrowserSave {
     localStorage: normalizeStringRecord(source.localStorage),
     sessionStorage: normalizeStringRecord(source.sessionStorage)
   };
+}
+
+function sanitizeReportedBrowserSave(save: PlayerBrowserSave): PlayerBrowserSave {
+  return {
+    localStorage: stripInternalStorageKeys(save.localStorage),
+    sessionStorage: stripInternalStorageKeys(save.sessionStorage)
+  };
+}
+
+function stripInternalStorageKeys(record: Record<string, string>) {
+  return Object.fromEntries(Object.entries(record).filter(([key]) => !isInternalStorageKey(key)));
+}
+
+function isInternalStorageKey(key: string) {
+  return key.startsWith("watch:") || key.startsWith("paperclip-battler:");
 }
 
 function normalizeStringRecord(value: unknown) {
