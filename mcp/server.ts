@@ -18,6 +18,7 @@ const ROOM_ID_LENGTH = 6;
 const ROOM_EVENT_HISTORY_LIMIT = 80;
 const DEFAULT_LOBBY_TTL_MS = Number(process.env.PAPERCLIP_DEFAULT_LOBBY_TTL_MS ?? 30 * 60 * 1000);
 const ROOM_PARTICIPANT_TTL_MS = Number(process.env.PAPERCLIP_ROOM_PARTICIPANT_TTL_MS ?? 15_000);
+const SPECTATOR_SAVE_SYNC_INTERVAL_MS = 5_000;
 const MAX_JSON_BODY_SIZE = 5_000_000;
 const PAPERCLIP_CLICK_RATE_LIMIT_LABEL = "10 clicks per second per session";
 const RATE_LIMIT_CLEANUP_INTERVAL_MS = 60_000;
@@ -1276,6 +1277,7 @@ function createSpectatorControllerScript(roomId: string, playerId: PlayerId) {
   ];
 
   let lastSaveSignature = "";
+  let syncInFlight = false;
 
   const normalizeRecord = (value) => {
     if (!value || typeof value !== "object" || Array.isArray(value)) return {};
@@ -1365,6 +1367,8 @@ function createSpectatorControllerScript(roomId: string, playerId: PlayerId) {
   };
 
   const syncSave = async () => {
+    if (document.hidden || syncInFlight) return;
+    syncInFlight = true;
     try {
       const response = await fetch(SAVE_URL, { cache: "no-store" });
       if (!response.ok) return;
@@ -1377,6 +1381,8 @@ function createSpectatorControllerScript(roomId: string, playerId: PlayerId) {
       window.location.reload();
     } catch {
       // The bridge may be restarting.
+    } finally {
+      syncInFlight = false;
     }
   };
 
@@ -1385,7 +1391,10 @@ function createSpectatorControllerScript(roomId: string, playerId: PlayerId) {
   const start = () => {
     installInputGuards();
     syncSave();
-    window.setInterval(syncSave, 2_000);
+    window.setInterval(syncSave, ${SPECTATOR_SAVE_SYNC_INTERVAL_MS});
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) syncSave();
+    });
   };
 
   if (document.readyState === "loading") {
@@ -2086,10 +2095,9 @@ function getGatewayRateLimitTarget(request: IncomingMessage, url: URL): RateLimi
   }
 
   if (isAssetProxyPath(url.pathname, roomPath)) {
-    return {
-      policy: RATE_LIMITS.assetProxy,
-      keyParts: [roomId, playerId, clientKey]
-    };
+    // Browser navigations and subresources do not have a separate error channel.
+    // Keep limiter responses on command/control APIs so iframe documents are not replaced by 429 JSON.
+    return null;
   }
 
   if (roomPath?.kind === "rooms" && roomPath.rest === "/events") {
@@ -2540,6 +2548,10 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   let inputShield = null;
   let inputTooltip = null;
   let reportTimer = null;
+  let configInFlight = false;
+  let reportInFlight = false;
+  let reportAgainAfterInFlight = false;
+  let pollInFlight = false;
   let lastReportAt = 0;
   let suppressClickReportUntil = 0;
   const heuristicCooldowns = new Map();
@@ -2788,6 +2800,8 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   };
 
   const refreshConfig = async () => {
+    if (configInFlight) return;
+    configInFlight = true;
     try {
       const response = await fetch(CONFIG_URL, { cache: "no-store" });
       if (!response.ok) throw new Error("config failed");
@@ -2796,6 +2810,8 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
       setReadyState(payload?.player?.ready, payload?.allPlayersReady);
     } catch {
       // The bridge may be restarting.
+    } finally {
+      configInFlight = false;
     }
   };
 
@@ -2964,6 +2980,11 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
       window.clearTimeout(reportTimer);
       reportTimer = null;
     }
+    if (reportInFlight) {
+      reportAgainAfterInFlight = true;
+      return;
+    }
+    reportInFlight = true;
     lastReportAt = Date.now();
 
     try {
@@ -2988,6 +3009,12 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
       });
     } catch {
       // The bridge may be restarting.
+    } finally {
+      reportInFlight = false;
+      if (reportAgainAfterInFlight) {
+        reportAgainAfterInFlight = false;
+        scheduleReport(REPORT_MIN_INTERVAL_MS);
+      }
     }
   };
 
@@ -3096,12 +3123,16 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   };
 
   const poll = async () => {
+    if (pollInFlight) return;
+    pollInFlight = true;
     try {
       const response = await fetch(COMMAND_URL, { cache: "no-store" });
       const command = await response.json();
       if (command && command.id) await runCommand(command);
     } catch {
       // The bridge may be restarting.
+    } finally {
+      pollInFlight = false;
     }
   };
 
