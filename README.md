@@ -1,6 +1,6 @@
 # Paperclip Battler
 
-A side-by-side wrapper for comparing two Universal Paperclips runs. Each player can be Human, Agent, or Both.
+A side-by-side wrapper for comparing two Universal Paperclips runs. Each player can be Human, Agent, Heuristic, or Both.
 
 This project loads the live web version of [Universal Paperclips](https://www.decisionproblem.com/paperclips/index2.html) and credits the original game. The original source/assets are not vendored into this repository.
 
@@ -35,9 +35,10 @@ Each pane can be set to:
 
 - `Human`: user clicks are allowed, MCP commands are rejected.
 - `Agent`: user clicks on game controls are blocked, MCP commands still run and show a visible press animation.
+- `Heuristic`: user clicks on game controls are blocked, and the browser runs a simple local button-priority AI after both players are ready.
 - `Both`: user clicks and MCP commands are both allowed.
 
-The `Ready` button is a shared start gate. User game input and MCP action commands are blocked until both players are marked ready, which lets humans or multiple agents connect, claim panes, inspect state, and then start without a timing advantage. Read-only state/list tools still work before both players are ready.
+The `Ready` button is a shared start gate. User game input, MCP action commands, and heuristic clicks are blocked until both players are marked ready, which lets humans or multiple agents connect, claim panes, inspect state, and then start without a timing advantage. Read-only state/list tools still work before both players are ready.
 
 ## Browser-Run Rooms
 
@@ -45,13 +46,18 @@ Paperclip Battler can create short room ids for browser-run multiplayer sessions
 
 Use the room controls in the app header to create a room, copy a play link like `/rooms/abc123`, copy a watch link like `/watch/abc123`, export the room JSON, or import a room JSON file. Watch links open the same two-pane game layout with read-only spectator frames.
 
-For embedded hosts, create rooms through the bridge API and link users to `/embed/abc123` for play or `/embed/watch/abc123` for spectator mode. Existing `/rooms/abc123?embed=1` and `/watch/abc123?embed=1` links also enable embedded mode. Embedded mode keeps the player panes visible but hides the app header, room creation/copy/export/import controls, bridge URL, and Paperclip Battler branding. Hosts can pass `?bridgeUrl=http%3A%2F%2F127.0.0.1%3A8787` when they need the embedded page to use a specific bridge.
+For embedded hosts, create rooms through the bridge API and link users to `/embed/abc123` for play or `/embed/watch/abc123` for spectator mode. `/embed?lobby=default` resolves to the current default lobby, creating or rotating it through the bridge when needed. Existing `/rooms/abc123?embed=1` and `/watch/abc123?embed=1` links also enable embedded mode. Embedded play mode assigns one active browser session to each player slot; once both slots are occupied, later sessions load as observers. Embedded mode keeps the player panes visible but hides the app header, room creation/copy/export/import controls, bridge URL, and Paperclip Battler branding. Hosts can pass `?bridgeUrl=http%3A%2F%2F127.0.0.1%3A8787` when they need the embedded page to use a specific bridge.
 
 Room-aware bridge endpoints:
 
 - `POST /rooms` with optional `{ "title": "Paperclip Battler" }`
+- `GET /lobbies/default`
+- `POST /lobbies/default/rotate`
 - `GET /rooms`
 - `GET /rooms/:id`
+- `POST /rooms/:id/participants`
+- `POST /rooms/:id/participants/heartbeat`
+- `POST /rooms/:id/participants/leave`
 - `GET /watch/:id`
 - `GET /rooms/:id/events` for SSE snapshot/room events
 - `GET /rooms/:id/export`
@@ -86,7 +92,7 @@ Paul's optional playbook lives at `docs/pauls-agent-ai-instructions.md`; Codex's
 
 For local development and chat-driven play, the bridge also exposes:
 
-- `POST /players/mode` with `{ "player": "left", "mode": "agent" }`
+- `POST /players/mode` with `{ "player": "left", "mode": "agent" }` or `{ "player": "right", "mode": "heuristic" }`
 - `POST /players/ready` with `{ "player": "right", "ready": true, "force": true }`
 - `POST /players/ready/reset`
 - `POST /players/claim` with `{ "player": "right", "controller": "Codex" }`

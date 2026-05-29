@@ -263,6 +263,12 @@ h1 {
   background: #ecfff5;
 }
 
+.mode-badge.heuristic {
+  color: #63396f;
+  border-color: #c7a1d1;
+  background: #fbf0ff;
+}
+
 .mode-badge.both {
   color: #254d82;
   border-color: #9fbce5;
@@ -375,6 +381,28 @@ h1 {
   min-height: 0;
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+
+.lobby-status {
+  min-height: 0;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: #ffffff;
+}
+
+.lobby-status div {
+  min-height: 42px;
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  border: 1px solid #c8beae;
+  border-radius: 7px;
+  padding: 0 14px;
+  color: #4e453c;
+  background: #f8f5ee;
+  font-size: 0.86rem;
+  font-weight: 900;
 }
 
 .pane.read-only iframe {

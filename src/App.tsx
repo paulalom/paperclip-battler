@@ -1,5 +1,6 @@
 import {
   Bot,
+  BrainCircuit,
   Check,
   Copy,
   Download,
@@ -23,6 +24,9 @@ const ORIGINAL_URL = "https://www.decisionproblem.com/paperclips/index2.html";
 const BRIDGE_URL_KEY = "paperclip-battler:bridge-url";
 const PLAYER_MODE_KEY = "paperclip-battler:player-modes";
 const ROOM_ID_KEY = "paperclip-battler:room-id";
+const ROOM_SESSION_ID_KEY = "paperclip-battler:room-session-id";
+const EMBED_LOBBY_MESSAGE_TYPE = "paperclip-battler:lobby-ready";
+const ROOM_SLOT_HEARTBEAT_MS = 4_000;
 const DEFAULT_ROOM_ID = "local";
 const PLAYER_IDS = ["left", "right"] as const;
 const PLAYER_LABELS: Record<PlayerId, string> = {
@@ -30,17 +34,17 @@ const PLAYER_LABELS: Record<PlayerId, string> = {
   right: "Player 2"
 };
 
+async function syncPlayerModeToBridge(baseUrl: string, roomId: string, playerId: PlayerId, mode: PlayerMode) {
+  const response = await fetch(`${baseUrl}/players/mode?room=${encodeURIComponent(roomId)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ room: roomId, player: playerId, mode })
+  });
+  if (!response.ok) throw new Error("Bridge rejected player mode sync.");
+}
+
 async function syncPlayerModesToBridge(baseUrl: string, roomId: string, modes: Record<PlayerId, PlayerMode>) {
-  const responses = await Promise.all(
-    PLAYER_IDS.map((playerId) =>
-      fetch(`${baseUrl}/players/mode?room=${encodeURIComponent(roomId)}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ room: roomId, player: playerId, mode: modes[playerId] })
-      })
-    )
-  );
-  if (responses.some((response) => !response.ok)) throw new Error("Bridge rejected player mode sync.");
+  await Promise.all(PLAYER_IDS.map((playerId) => syncPlayerModeToBridge(baseUrl, roomId, playerId, modes[playerId])));
 }
 const DEFAULT_PLAYER_MODES: Record<PlayerId, PlayerMode> = {
   left: "human",
@@ -48,7 +52,7 @@ const DEFAULT_PLAYER_MODES: Record<PlayerId, PlayerMode> = {
 };
 
 type PlayerId = (typeof PLAYER_IDS)[number];
-type PlayerMode = "human" | "agent" | "both";
+type PlayerMode = "human" | "agent" | "heuristic" | "both";
 
 type BridgePlayerHealth = {
   id: PlayerId;
@@ -56,6 +60,7 @@ type BridgePlayerHealth = {
   mode: PlayerMode;
   ready: boolean;
   agentEnabled: boolean;
+  heuristicEnabled?: boolean;
   userClicksAllowed: boolean;
   connected: boolean;
   agentConnected: boolean;
@@ -99,6 +104,16 @@ type BridgeRoomSlot = {
   claim: BridgePlayerClaim | null;
 };
 
+type BridgeRoomParticipant = {
+  sessionId?: string;
+  sessionSuffix: string;
+  role: "player" | "observer";
+  player: PlayerId | null;
+  joinedAt: number;
+  lastSeenAt: number;
+  ttlMs: number;
+};
+
 type BridgeRoom = {
   id: string;
   title: string;
@@ -108,6 +123,10 @@ type BridgeRoom = {
   roomUrl: string;
   watchUrl: string;
   spectatorCount: number;
+  participantCount: number;
+  playerCount: number;
+  observerCount: number;
+  participants: BridgeRoomParticipant[];
   eventCount: number;
   snapshotCount: number;
   slots: Partial<Record<PlayerId, BridgeRoomSlot>>;
@@ -135,21 +154,43 @@ type AppRoute = {
   roomId: string | null;
   view: RoomView;
   embedded: boolean;
+  defaultLobby: boolean;
 };
+
+function notifyEmbeddedHost(roomId: string, view: RoomView) {
+  if (window.parent === window) return;
+
+  window.parent.postMessage(
+    {
+      source: "paperclip-battler",
+      type: EMBED_LOBBY_MESSAGE_TYPE,
+      lobbyId: roomId,
+      roomId,
+      view,
+      url: window.location.href
+    },
+    "*"
+  );
+}
 
 export function App() {
   const initialRoute = readRoomRoute();
   const [bridgeUrl, setBridgeUrl] = useState(() => readInitialBridgeUrl());
-  const [roomId, setRoomId] = useState(() => initialRoute.roomId ?? localStorage.getItem(ROOM_ID_KEY) ?? DEFAULT_ROOM_ID);
+  const [roomId, setRoomId] = useState(() =>
+    initialRoute.defaultLobby ? DEFAULT_ROOM_ID : initialRoute.roomId ?? localStorage.getItem(ROOM_ID_KEY) ?? DEFAULT_ROOM_ID
+  );
   const [roomView, setRoomView] = useState<RoomView>(() => initialRoute.view);
   const [embedded, setEmbedded] = useState(() => initialRoute.embedded);
+  const [useDefaultLobby, setUseDefaultLobby] = useState(() => initialRoute.defaultLobby);
   const [roomNotice, setRoomNotice] = useState("");
   const [playerModes, setPlayerModes] = useState<Record<PlayerId, PlayerMode>>(readPlayerModes);
   const [health, setHealth] = useState<BridgeHealth | null>(null);
   const [status, setStatus] = useState<BridgeStatus>("checking");
+  const [roomParticipant, setRoomParticipant] = useState<BridgeRoomParticipant | null>(null);
   const importInputRef = useRef<HTMLInputElement>(null);
   const leftFrame = useRef<HTMLIFrameElement>(null);
   const rightFrame = useRef<HTMLIFrameElement>(null);
+  const roomSessionIdRef = useRef(readRoomSessionId());
 
   const frameRefs: Record<PlayerId, React.RefObject<HTMLIFrameElement>> = {
     left: leftFrame,
@@ -158,21 +199,28 @@ export function App() {
   const trimmedBridgeUrl = useMemo(() => bridgeUrl.replace(/\/+$/, ""), [bridgeUrl]);
   const playUrl = `${window.location.origin}/rooms/${encodeURIComponent(roomId)}`;
   const watchUrl = `${window.location.origin}/watch/${encodeURIComponent(roomId)}`;
+  const usesRoomSlots = embedded && roomView === "play" && !useDefaultLobby;
+
+  useEffect(() => {
+    if (!embedded || useDefaultLobby || !roomId) return;
+    notifyEmbeddedHost(roomId, roomView);
+  }, [embedded, roomId, roomView, useDefaultLobby]);
 
   useEffect(() => {
     localStorage.setItem(BRIDGE_URL_KEY, bridgeUrl);
   }, [bridgeUrl]);
 
   useEffect(() => {
-    localStorage.setItem(ROOM_ID_KEY, roomId);
-  }, [roomId]);
+    if (!useDefaultLobby) localStorage.setItem(ROOM_ID_KEY, roomId);
+  }, [roomId, useDefaultLobby]);
 
   useEffect(() => {
     const onPopState = () => {
       const nextRoute = readRoomRoute();
-      setRoomId(nextRoute.roomId ?? localStorage.getItem(ROOM_ID_KEY) ?? DEFAULT_ROOM_ID);
+      setRoomId(nextRoute.defaultLobby ? DEFAULT_ROOM_ID : nextRoute.roomId ?? localStorage.getItem(ROOM_ID_KEY) ?? DEFAULT_ROOM_ID);
       setRoomView(nextRoute.view);
       setEmbedded(nextRoute.embedded);
+      setUseDefaultLobby(nextRoute.defaultLobby);
     };
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
@@ -183,11 +231,51 @@ export function App() {
   }, [playerModes]);
 
   useEffect(() => {
+    if (!useDefaultLobby) return undefined;
+
+    let cancelled = false;
+
+    async function resolveDefaultLobby() {
+      setStatus("checking");
+      try {
+        const response = await fetch(`${trimmedBridgeUrl}/lobbies/default`, { cache: "no-store" });
+        if (!response.ok) throw new Error(`Bridge returned ${response.status}`);
+        const payload = (await response.json()) as { room?: BridgeRoom };
+        if (!payload.room?.id) throw new Error("Bridge did not return a lobby room.");
+        if (cancelled) return;
+        setRoomId(payload.room.id);
+        setRoomView("play");
+        setUseDefaultLobby(false);
+        setRoomNotice(`Lobby ${payload.room.id} ready`);
+        window.history.replaceState({}, "", roomRoutePath(payload.room.id, "play", embedded));
+      } catch {
+        if (!cancelled) {
+          setStatus("offline");
+          setRoomNotice("Default lobby offline");
+          setUseDefaultLobby(false);
+        }
+      }
+    }
+
+    resolveDefaultLobby();
+    return () => {
+      cancelled = true;
+    };
+  }, [embedded, trimmedBridgeUrl, useDefaultLobby]);
+
+  useEffect(() => {
+    if (useDefaultLobby) return undefined;
+
     let cancelled = false;
 
     async function syncModes() {
       try {
-        await syncPlayerModesToBridge(trimmedBridgeUrl, roomId, playerModes);
+        if (usesRoomSlots) {
+          if (roomParticipant?.role !== "player" || !roomParticipant.player) return;
+          await syncPlayerModeToBridge(trimmedBridgeUrl, roomId, roomParticipant.player, playerModes[roomParticipant.player]);
+        } else {
+          await syncPlayerModesToBridge(trimmedBridgeUrl, roomId, playerModes);
+        }
       } catch {
         if (!cancelled) setStatus("offline");
       }
@@ -197,9 +285,11 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [playerModes, roomId, trimmedBridgeUrl]);
+  }, [playerModes, roomId, roomParticipant?.player, roomParticipant?.role, trimmedBridgeUrl, useDefaultLobby, usesRoomSlots]);
 
   useEffect(() => {
+    if (useDefaultLobby) return undefined;
+
     let cancelled = false;
 
     async function pollHealth() {
@@ -207,19 +297,28 @@ export function App() {
         const response = await fetch(`${trimmedBridgeUrl}/health?room=${encodeURIComponent(roomId)}`, { cache: "no-store" });
         if (!response.ok) throw new Error(`Bridge returned ${response.status}`);
         let nextHealth = (await response.json()) as BridgeHealth;
-        const bridgeModeMismatch = PLAYER_IDS.some((playerId) => nextHealth.players?.[playerId]?.mode !== playerModes[playerId]);
+        const managedPlayerIds =
+          usesRoomSlots && roomParticipant?.role === "player" && roomParticipant.player
+            ? [roomParticipant.player]
+            : usesRoomSlots
+              ? []
+              : [...PLAYER_IDS];
+        const bridgeModeMismatch = managedPlayerIds.some((playerId) => nextHealth.players?.[playerId]?.mode !== playerModes[playerId]);
         if (bridgeModeMismatch) {
-          await syncPlayerModesToBridge(trimmedBridgeUrl, roomId, playerModes);
+          await Promise.all(
+            managedPlayerIds.map((playerId) => syncPlayerModeToBridge(trimmedBridgeUrl, roomId, playerId, playerModes[playerId]))
+          );
           const syncedPlayers: Partial<Record<PlayerId, BridgePlayerHealth>> = { ...(nextHealth.players ?? {}) };
-          for (const playerId of PLAYER_IDS) {
+          for (const playerId of managedPlayerIds) {
             const player = syncedPlayers[playerId];
             if (!player) continue;
             const mode = playerModes[playerId];
             syncedPlayers[playerId] = {
               ...player,
               mode,
-              agentEnabled: mode !== "human",
-              userClicksAllowed: mode !== "agent"
+              agentEnabled: mode === "agent" || mode === "both",
+              heuristicEnabled: mode === "heuristic",
+              userClicksAllowed: mode === "human" || mode === "both"
             };
           }
           nextHealth = {
@@ -246,17 +345,75 @@ export function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [playerModes, roomId, trimmedBridgeUrl]);
+  }, [playerModes, roomId, roomParticipant?.player, roomParticipant?.role, trimmedBridgeUrl, useDefaultLobby, usesRoomSlots]);
 
   useEffect(() => {
-    if (!roomId) return;
+    if (!roomId || useDefaultLobby) return undefined;
     const events = new EventSource(`${trimmedBridgeUrl}/rooms/${encodeURIComponent(roomId)}/events`);
     const markConnected = () => setStatus((current) => (current === "offline" ? "checking" : current));
     events.addEventListener("snapshot", markConnected);
     events.addEventListener("room", markConnected);
     events.onerror = () => events.close();
     return () => events.close();
-  }, [roomId, trimmedBridgeUrl]);
+  }, [roomId, trimmedBridgeUrl, useDefaultLobby]);
+
+  useEffect(() => {
+    if (!usesRoomSlots || !roomId) {
+      setRoomParticipant(null);
+      return undefined;
+    }
+
+    let cancelled = false;
+    async function postParticipant(path: "participants" | "participants/heartbeat") {
+      const response = await fetch(`${trimmedBridgeUrl}/rooms/${encodeURIComponent(roomId)}/${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: roomSessionIdRef.current })
+      });
+      if (!response.ok) throw new Error(`Bridge returned ${response.status}`);
+      const payload = (await response.json()) as { participant?: BridgeRoomParticipant };
+      if (!cancelled && payload.participant) {
+        if (payload.participant.sessionId && payload.participant.sessionId !== roomSessionIdRef.current) {
+          roomSessionIdRef.current = payload.participant.sessionId;
+          sessionStorage.setItem(ROOM_SESSION_ID_KEY, payload.participant.sessionId);
+        }
+        setRoomParticipant(payload.participant);
+        setStatus("connected");
+      }
+    }
+
+    const leaveParticipant = () => {
+      const body = JSON.stringify({ sessionId: roomSessionIdRef.current });
+      const url = `${trimmedBridgeUrl}/rooms/${encodeURIComponent(roomId)}/participants/leave`;
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon(url, new Blob([body], { type: "application/json" }));
+        return;
+      }
+      void fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+        keepalive: true
+      }).catch(() => undefined);
+    };
+
+    postParticipant("participants").catch(() => {
+      if (!cancelled) setStatus("offline");
+    });
+    const timer = window.setInterval(() => {
+      postParticipant("participants/heartbeat").catch(() => {
+        if (!cancelled) setStatus("offline");
+      });
+    }, ROOM_SLOT_HEARTBEAT_MS);
+
+    window.addEventListener("pagehide", leaveParticipant);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      window.removeEventListener("pagehide", leaveParticipant);
+      leaveParticipant();
+    };
+  }, [roomId, trimmedBridgeUrl, usesRoomSlots]);
 
   function playerUrl(playerId: PlayerId) {
     return `${trimmedBridgeUrl}/rooms/${encodeURIComponent(roomId)}/players/${playerId}/index2.html`;
@@ -356,20 +513,26 @@ export function App() {
           [playerId]: {
             ...currentPlayer,
             mode,
-            agentEnabled: mode !== "human",
-            userClicksAllowed: mode !== "agent"
+            agentEnabled: mode === "agent" || mode === "both",
+            heuristicEnabled: mode === "heuristic",
+            userClicksAllowed: mode === "human" || mode === "both"
           }
         }
       };
     });
   }
 
-  function navigateRoom(nextRoomId: string, nextView: RoomView) {
+  function navigateRoom(nextRoomId: string, nextView: RoomView, options: { replace?: boolean } = {}) {
     const normalized = normalizeRoomId(nextRoomId);
+    setUseDefaultLobby(false);
     setRoomId(normalized);
     setRoomView(nextView);
     const nextPath = roomRoutePath(normalized, nextView, embedded);
-    window.history.pushState({}, "", nextPath);
+    if (options.replace) {
+      window.history.replaceState({}, "", nextPath);
+    } else {
+      window.history.pushState({}, "", nextPath);
+    }
   }
 
   async function createRoom() {
@@ -436,6 +599,10 @@ export function App() {
       setRoomNotice("Import failed");
     }
   }
+
+  const assignedPlayer = usesRoomSlots && roomParticipant?.role === "player" ? roomParticipant.player : null;
+  const observerMode = usesRoomSlots && roomParticipant?.role === "observer";
+  const waitingForSlot = usesRoomSlots && !roomParticipant;
 
   return (
     <main className={`app-shell ${embedded ? "embedded" : ""}`}>
@@ -504,8 +671,37 @@ export function App() {
         </header>
       ) : null}
 
-      {roomView === "watch" ? (
+      {useDefaultLobby ? (
+        <LobbyStatusView message={status === "offline" ? "Default lobby offline" : "Finding lobby"} />
+      ) : waitingForSlot ? (
+        <LobbyStatusView message={status === "offline" ? "Room bridge offline" : "Joining lobby"} />
+      ) : roomView === "watch" || observerMode ? (
         <WatchView health={health} status={status} playerModes={playerModes} sourceForPlayer={spectatorUrl} />
+      ) : assignedPlayer ? (
+        <section className="split-view">
+          {PLAYER_IDS.map((playerId) => {
+            const isAssignedPlayer = playerId === assignedPlayer;
+            const noop = () => undefined;
+            return (
+              <OriginalPane
+                key={playerId}
+                title={isAssignedPlayer ? `${PLAYER_LABELS[playerId]} (you)` : PLAYER_LABELS[playerId]}
+                source={isAssignedPlayer ? playerUrl(playerId) : spectatorUrl(playerId)}
+                mode={isAssignedPlayer ? playerModes[playerId] : health?.players?.[playerId]?.mode ?? playerModes[playerId]}
+                health={health?.players?.[playerId]}
+                frameRef={isAssignedPlayer ? frameRefs[playerId] : undefined}
+                disabled={status === "offline"}
+                allPlayersReady={Boolean(health?.allPlayersReady)}
+                readOnly={!isAssignedPlayer}
+                onModeChange={isAssignedPlayer ? (mode) => setPlayerMode(playerId, mode) : noop}
+                onReadyChange={isAssignedPlayer ? (ready) => setPlayerReady(playerId, ready) : noop}
+                onReload={isAssignedPlayer ? () => reloadPlayer(playerId) : noop}
+                onReset={isAssignedPlayer ? () => resetPlayer(playerId) : noop}
+                onReleaseClaim={isAssignedPlayer ? () => releasePlayerClaim(playerId) : noop}
+              />
+            );
+          })}
+        </section>
       ) : (
         <section className="split-view">
           {PLAYER_IDS.map((playerId) => (
@@ -562,6 +758,17 @@ function WatchView({
           onReleaseClaim={noop}
         />
       ))}
+    </section>
+  );
+}
+
+function LobbyStatusView({ message }: { message: string }) {
+  return (
+    <section className="lobby-status" role="status" aria-live="polite">
+      <div>
+        <Users size={18} />
+        <span>{message}</span>
+      </div>
     </section>
   );
 }
@@ -626,6 +833,7 @@ function OriginalPane({
   const claim = health?.claim ?? null;
   const ready = Boolean(health?.ready);
   const readyLocked = mode === "agent";
+  const mouseLocked = mode === "agent" || mode === "heuristic";
   const controlsDisabled = disabled || readOnly;
   const readyDisabled = controlsDisabled || readyLocked;
   const readyTitle = readOnly
@@ -654,14 +862,14 @@ function OriginalPane({
           ) : null}
           {mode !== "human" ? (
             <span className={`agent-badge ${connected ? "online" : "waiting"}`}>
-              <Server size={14} />
+              {mode === "heuristic" ? <BrainCircuit size={14} /> : <Server size={14} />}
               {buttonCount} buttons
             </span>
           ) : null}
-          {mode === "agent" ? (
+          {mouseLocked ? (
             <span className="agent-badge locked">
               <Lock size={14} />
-              Mouse locked
+              {mode === "heuristic" ? "AI control" : "Mouse locked"}
             </span>
           ) : null}
           {readOnly ? (
@@ -720,7 +928,7 @@ function PlayerModePicker({
 }) {
   return (
     <div className="mode-picker" aria-label="Player control mode">
-      {(["human", "agent", "both"] as PlayerMode[]).map((option) => (
+      {(["human", "agent", "heuristic", "both"] as PlayerMode[]).map((option) => (
         <button
           key={option}
           className={mode === option ? "active" : ""}
@@ -746,28 +954,32 @@ function bridgeLabel(status: BridgeStatus, health: BridgeHealth | null) {
 function readRoomRoute(): AppRoute {
   const embedded = isEmbeddedRoute();
   const queryRoom = getQueryRoomId();
+  const defaultLobby = shouldUseDefaultLobby(queryRoom);
   const embedMatch = window.location.pathname.match(/^\/embed(?:\/(rooms|watch))?\/([^/]+)/);
   if (embedMatch) {
     return {
       roomId: normalizeRoomId(decodeURIComponent(embedMatch[2])),
       view: embedMatch[1] === "watch" ? "watch" : "play",
-      embedded: true
+      embedded: true,
+      defaultLobby: false
     };
   }
 
   const match = window.location.pathname.match(/^\/(rooms|watch)\/([^/]+)/);
   if (!match) {
     return {
-      roomId: queryRoom,
+      roomId: defaultLobby ? null : queryRoom,
       view: queryView(),
-      embedded
+      embedded,
+      defaultLobby
     };
   }
 
   return {
     roomId: normalizeRoomId(decodeURIComponent(match[2])),
     view: match[1] === "watch" ? "watch" : "play",
-    embedded
+    embedded,
+    defaultLobby: false
   };
 }
 
@@ -782,6 +994,15 @@ function isEmbeddedRoute() {
   if (window.location.pathname === "/embed" || window.location.pathname.startsWith("/embed/")) return true;
   if (flag === null) return false;
   return !["0", "false", "no", "off"].includes(flag.toLowerCase());
+}
+
+function shouldUseDefaultLobby(queryRoom: string | null) {
+  if (queryRoom) return false;
+  const params = new URLSearchParams(window.location.search);
+  const lobby = params.get("lobby")?.trim().toLowerCase();
+  const defaultLobby = params.get("defaultLobby")?.trim().toLowerCase();
+  if (lobby === "default" || defaultLobby === "1" || defaultLobby === "true") return true;
+  return window.location.pathname === "/embed" || window.location.pathname === "/embed/";
 }
 
 function getQueryRoomId() {
@@ -804,6 +1025,21 @@ function normalizeRoomId(value: string) {
   return value.trim().toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, 32) || DEFAULT_ROOM_ID;
 }
 
+function readRoomSessionId() {
+  const saved = sessionStorage.getItem(ROOM_SESSION_ID_KEY);
+  if (saved && /^[A-Za-z0-9_-]{8,96}$/.test(saved)) return saved;
+  const next = createRoomSessionId();
+  sessionStorage.setItem(ROOM_SESSION_ID_KEY, next);
+  return next;
+}
+
+function createRoomSessionId() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  const values = new Uint32Array(4);
+  crypto.getRandomValues(values);
+  return Array.from(values, (value) => value.toString(16).padStart(8, "0")).join("");
+}
+
 function readPlayerModes(): Record<PlayerId, PlayerMode> {
   try {
     const saved = JSON.parse(localStorage.getItem(PLAYER_MODE_KEY) ?? "{}") as Partial<Record<PlayerId, PlayerMode>>;
@@ -817,23 +1053,26 @@ function readPlayerModes(): Record<PlayerId, PlayerMode> {
 }
 
 function isPlayerMode(value: unknown): value is PlayerMode {
-  return value === "human" || value === "agent" || value === "both";
+  return value === "human" || value === "agent" || value === "heuristic" || value === "both";
 }
 
 function modeLabel(mode: PlayerMode) {
   if (mode === "agent") return "Agent";
+  if (mode === "heuristic") return "Heuristic";
   if (mode === "both") return "Both";
   return "Human";
 }
 
 function modeTitle(mode: PlayerMode) {
   if (mode === "agent") return "MCP only";
+  if (mode === "heuristic") return "Built-in heuristic AI";
   if (mode === "both") return "Human and MCP";
   return "Human only";
 }
 
 function modeIcon(mode: PlayerMode) {
   if (mode === "agent") return <Bot size={14} />;
+  if (mode === "heuristic") return <BrainCircuit size={14} />;
   if (mode === "both") return <Users size={14} />;
   return <User size={14} />;
 }

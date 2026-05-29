@@ -16,6 +16,8 @@ const CLAIM_TTL_MS = Number(process.env.PAPERCLIP_PLAYER_CLAIM_TTL_MS ?? 10 * 60
 const DEFAULT_ROOM_ID = "local";
 const ROOM_ID_LENGTH = 6;
 const ROOM_EVENT_HISTORY_LIMIT = 80;
+const DEFAULT_LOBBY_TTL_MS = Number(process.env.PAPERCLIP_DEFAULT_LOBBY_TTL_MS ?? 30 * 60 * 1000);
+const ROOM_PARTICIPANT_TTL_MS = Number(process.env.PAPERCLIP_ROOM_PARTICIPANT_TTL_MS ?? 15_000);
 const MAX_JSON_BODY_SIZE = 5_000_000;
 const PAPERCLIP_CLICK_RATE_LIMIT_LABEL = "10 clicks per second per session";
 const RATE_LIMIT_CLEANUP_INTERVAL_MS = 60_000;
@@ -35,7 +37,7 @@ const CODEX_INSTRUCTION_PATHS = [
 const INSTRUCTION_MODES = ["none", "paul", "codex"] as const;
 const PLAYER_IDS = ["left", "right"] as const;
 const PLAYER_REF_VALUES = ["left", "right", "player", "agent", "p1", "p2", "1", "2"] as const;
-const PLAYER_MODES = ["human", "agent", "both"] as const;
+const PLAYER_MODES = ["human", "agent", "heuristic", "both"] as const;
 
 type InstructionMode = (typeof INSTRUCTION_MODES)[number];
 type PlayerId = (typeof PLAYER_IDS)[number];
@@ -43,6 +45,7 @@ type PlayerRef = (typeof PLAYER_REF_VALUES)[number];
 type PlayerMode = (typeof PLAYER_MODES)[number];
 type PlayerAssetMode = "player" | "spectator";
 type StoragePartitionMode = "player" | "spectator";
+type RoomParticipantRole = "player" | "observer";
 
 type RateLimitPolicy = {
   name: string;
@@ -241,6 +244,14 @@ type PlayerClaim = {
   expiresAt: number;
 };
 
+type RoomParticipant = {
+  sessionId: string;
+  role: RoomParticipantRole;
+  player: PlayerId | null;
+  joinedAt: number;
+  lastSeenAt: number;
+};
+
 type RoomEvent = {
   id: number;
   roomId: string;
@@ -256,6 +267,7 @@ type RoomState = {
   updatedAt: number;
   tinyState: Record<string, unknown>;
   playerStates: Map<PlayerId, PlayerState>;
+  participants: Map<string, RoomParticipant>;
   events: RoomEvent[];
   nextEventId: number;
   sseClients: Set<ServerResponse>;
@@ -264,6 +276,7 @@ type RoomState = {
 const rooms = new Map<string, RoomState>([[DEFAULT_ROOM_ID, createRoomState(DEFAULT_ROOM_ID, "Local Room")]]);
 
 let instructionMode: InstructionMode = "none";
+let defaultLobby: { roomId: string; createdAt: number } | null = null;
 let lastRateLimitCleanupAt = Date.now();
 const rateLimitBuckets = new Map<string, RateLimitBucket>();
 const commandWaiters = new Map<string, (result: AgentCommandResult) => void>();
@@ -646,6 +659,17 @@ function startBridge() {
     try {
       if (!applyGatewayRateLimit(request, response, url)) return;
 
+      if (request.method === "GET" && url.pathname === "/lobbies/default") {
+        sendJson(response, 200, { ok: true, ...serializeDefaultLobby(getDefaultLobbyRoom()) });
+        return;
+      }
+
+      if (request.method === "POST" && (url.pathname === "/lobbies/default" || url.pathname === "/lobbies/default/rotate")) {
+        const body = await readJsonBody<{ title?: string }>(request);
+        sendJson(response, 201, { ok: true, ...serializeDefaultLobby(rotateDefaultLobby(body.title)) });
+        return;
+      }
+
       if (request.method === "GET" && url.pathname === "/rooms") {
         sendJson(response, 200, { ok: true, rooms: Array.from(rooms.keys()).map((roomId) => serializeRoom(roomId)) });
         return;
@@ -961,6 +985,35 @@ async function handleRoomPath(
 
   if (request.method === "GET" && roomPath.rest === "/") {
     sendJson(response, 200, { ...getBridgeState(roomId), role: roomPath.kind === "watch" ? "spectator" : "player" });
+    return true;
+  }
+
+  if (request.method === "POST" && roomPath.kind === "rooms" && roomPath.rest === "/participants") {
+    const body = await readJsonBody<{ sessionId?: string }>(request);
+    const participant = joinRoomParticipant(roomId, body.sessionId);
+    sendJson(response, 200, {
+      ok: true,
+      room: serializeRoom(roomId),
+      participant: serializeRoomParticipant(participant, true)
+    });
+    return true;
+  }
+
+  if (request.method === "POST" && roomPath.kind === "rooms" && roomPath.rest === "/participants/heartbeat") {
+    const body = await readJsonBody<{ sessionId?: string }>(request);
+    const participant = heartbeatRoomParticipant(roomId, body.sessionId);
+    sendJson(response, 200, {
+      ok: true,
+      room: serializeRoom(roomId),
+      participant: serializeRoomParticipant(participant, true)
+    });
+    return true;
+  }
+
+  if (request.method === "POST" && roomPath.kind === "rooms" && roomPath.rest === "/participants/leave") {
+    const body = await readJsonBody<{ sessionId?: string }>(request);
+    leaveRoomParticipant(roomId, body.sessionId);
+    sendJson(response, 200, { ok: true, room: serializeRoom(roomId) });
     return true;
   }
 
@@ -1342,6 +1395,7 @@ function createRoomState(roomId: string, title?: string): RoomState {
     updatedAt: now,
     tinyState: {},
     playerStates: createPlayerStates(),
+    participants: new Map(),
     events: [],
     nextEventId: 1,
     sseClients: new Set()
@@ -1390,8 +1444,51 @@ function getBridgeState(roomId = DEFAULT_ROOM_ID) {
   };
 }
 
+function getDefaultLobbyRoom() {
+  const now = Date.now();
+  if (!defaultLobby || shouldRotateDefaultLobby(now)) {
+    return rotateDefaultLobby(undefined, now);
+  }
+
+  return getRoomState(defaultLobby.roomId);
+}
+
+function shouldRotateDefaultLobby(now = Date.now()) {
+  if (!defaultLobby) return true;
+  const room = getRoomState(defaultLobby.roomId);
+  const activePlayers = getActiveRoomParticipants(room, now).filter((participant) => participant.role === "player").length;
+  return activePlayers === 0 && now - defaultLobby.createdAt >= DEFAULT_LOBBY_TTL_MS;
+}
+
+function rotateDefaultLobby(title?: unknown, now = Date.now()) {
+  const roomId = createShortRoomId();
+  const room = getRoomState(roomId, normalizeRoomTitle(title, roomId));
+  defaultLobby = { roomId, createdAt: now };
+  touchRoom(roomId);
+  emitRoomEvent(roomId, "room", { room: serializeRoom(roomId), lobby: "default" });
+  return room;
+}
+
+function serializeDefaultLobby(room: RoomState) {
+  const createdAt = defaultLobby?.roomId === room.id ? defaultLobby.createdAt : room.createdAt;
+  return {
+    lobby: {
+      id: "default",
+      roomId: room.id,
+      createdAt,
+      rotatesAfterMs: DEFAULT_LOBBY_TTL_MS,
+      participantTtlMs: ROOM_PARTICIPANT_TTL_MS
+    },
+    room: serializeRoom(room.id)
+  };
+}
+
 function serializeRoom(roomId: string) {
   const room = getRoomState(roomId);
+  const participants = getActiveRoomParticipants(room);
+  const playerParticipants = participants.filter((participant) => participant.role === "player");
+  const observerParticipants = participants.filter((participant) => participant.role === "observer");
+
   return {
     id: room.id,
     title: room.title,
@@ -1400,7 +1497,11 @@ function serializeRoom(roomId: string) {
     tinyState: room.tinyState,
     roomUrl: `http://127.0.0.1:${BRIDGE_PORT}/rooms/${room.id}`,
     watchUrl: `http://127.0.0.1:${BRIDGE_PORT}/watch/${room.id}`,
-    spectatorCount: room.sseClients.size,
+    spectatorCount: observerParticipants.length + room.sseClients.size,
+    participantCount: participants.length,
+    playerCount: playerParticipants.length,
+    observerCount: observerParticipants.length,
+    participants: participants.map((participant) => serializeRoomParticipant(participant, false)),
     eventCount: room.events.length,
     snapshotCount: PLAYER_IDS.filter((playerId) => Boolean(getPlayerState(roomId, playerId).latestReport)).length,
     slots: Object.fromEntries(
@@ -1421,6 +1522,88 @@ function serializeRoom(roomId: string) {
         ];
       })
     )
+  };
+}
+
+function joinRoomParticipant(roomId: string, value: unknown) {
+  const room = getRoomState(roomId);
+  const now = Date.now();
+  cleanupRoomParticipants(room, now);
+
+  const sessionId = normalizeRoomSessionId(value);
+  const existing = room.participants.get(sessionId);
+  const occupied = new Set(
+    getActiveRoomParticipants(room, now)
+      .filter((participant) => participant.sessionId !== sessionId && participant.role === "player" && participant.player)
+      .map((participant) => participant.player as PlayerId)
+  );
+
+  if (existing?.role === "player" && existing.player && !occupied.has(existing.player)) {
+    existing.lastSeenAt = now;
+    touchRoom(roomId);
+    return existing;
+  }
+
+  const openPlayer = PLAYER_IDS.find((playerId) => !occupied.has(playerId)) ?? null;
+  const participant: RoomParticipant = {
+    sessionId,
+    role: openPlayer ? "player" : "observer",
+    player: openPlayer,
+    joinedAt: existing?.joinedAt ?? now,
+    lastSeenAt: now
+  };
+
+  room.participants.set(sessionId, participant);
+  touchRoom(roomId);
+  emitRoomEvent(roomId, "room", { room: serializeRoom(roomId), participant: serializeRoomParticipant(participant, false) });
+  return participant;
+}
+
+function heartbeatRoomParticipant(roomId: string, value: unknown) {
+  const room = getRoomState(roomId);
+  const now = Date.now();
+  cleanupRoomParticipants(room, now);
+
+  const sessionId = normalizeRoomSessionId(value);
+  const participant = room.participants.get(sessionId);
+  if (!participant) return joinRoomParticipant(roomId, sessionId);
+
+  participant.lastSeenAt = now;
+  touchRoom(roomId);
+  return participant;
+}
+
+function leaveRoomParticipant(roomId: string, value: unknown) {
+  const room = getRoomState(roomId);
+  const sessionId = normalizeRoomSessionId(value);
+  if (!room.participants.delete(sessionId)) return;
+
+  touchRoom(roomId);
+  emitRoomEvent(roomId, "room", { room: serializeRoom(roomId) });
+}
+
+function getActiveRoomParticipants(room: RoomState, now = Date.now()) {
+  cleanupRoomParticipants(room, now);
+  return Array.from(room.participants.values()).filter((participant) => now - participant.lastSeenAt <= ROOM_PARTICIPANT_TTL_MS);
+}
+
+function cleanupRoomParticipants(room: RoomState, now = Date.now()) {
+  for (const [sessionId, participant] of room.participants) {
+    if (now - participant.lastSeenAt > ROOM_PARTICIPANT_TTL_MS) {
+      room.participants.delete(sessionId);
+    }
+  }
+}
+
+function serializeRoomParticipant(participant: RoomParticipant, revealSessionId: boolean) {
+  return {
+    sessionId: revealSessionId ? participant.sessionId : undefined,
+    sessionSuffix: participant.sessionId.slice(-8),
+    role: participant.role,
+    player: participant.player,
+    joinedAt: participant.joinedAt,
+    lastSeenAt: participant.lastSeenAt,
+    ttlMs: Math.max(0, ROOM_PARTICIPANT_TTL_MS - (Date.now() - participant.lastSeenAt))
   };
 }
 
@@ -1502,6 +1685,7 @@ function getPlayerMeta(roomId: string, playerId: PlayerId) {
     mode: state.mode,
     ready: state.ready,
     agentEnabled: agentCanAct(state.mode),
+    heuristicEnabled: heuristicCanAct(state.mode),
     userClicksAllowed: userClicksAllowed(state.mode),
     claim: serializeClaim(getActiveClaim(roomId, playerId), false)
   };
@@ -1588,7 +1772,7 @@ function ensurePlayerClaim(
 ) {
   const state = getPlayerState(roomId, playerId);
   if (!agentCanAct(state.mode)) {
-    throw new Error(`${PLAYER_LABELS[playerId]} is human-only. Set it to Agent or Both before using MCP commands.`);
+    throw new Error(`${PLAYER_LABELS[playerId]} is not MCP-controlled. Set it to Agent or Both before using MCP commands.`);
   }
 
   clearExpiredClaim(state);
@@ -1770,7 +1954,7 @@ function queueCommand(roomId: string, playerId: PlayerId, command: AgentCommand)
   const state = getPlayerState(roomId, playerId);
 
   if (!agentCanAct(state.mode)) {
-    throw new Error(`${PLAYER_LABELS[playerId]} is human-only. Set it to Agent or Both before using MCP commands.`);
+    throw new Error(`${PLAYER_LABELS[playerId]} is not MCP-controlled. Set it to Agent or Both before using MCP commands.`);
   }
 
   if (command.type !== "reset" && command.type !== "import-save" && !allPlayersReady(roomId)) {
@@ -2117,6 +2301,14 @@ function normalizeRoomId(value: unknown) {
   return normalized;
 }
 
+function normalizeRoomSessionId(value: unknown) {
+  const normalized = String(value ?? "")
+    .trim()
+    .replace(/[^A-Za-z0-9_-]/g, "")
+    .slice(0, 96);
+  return normalized.length >= 8 ? normalized : randomUUID();
+}
+
 function createShortRoomId() {
   for (let attempt = 0; attempt < 20; attempt += 1) {
     const roomId = randomUUID().replace(/-/g, "").slice(0, ROOM_ID_LENGTH);
@@ -2214,11 +2406,15 @@ function normalizePlayerMode(value: unknown): PlayerMode {
   if (typeof value === "string" && PLAYER_MODES.includes(value as PlayerMode)) {
     return value as PlayerMode;
   }
-  throw new Error("Player mode must be human, agent, or both.");
+  throw new Error("Player mode must be human, agent, heuristic, or both.");
 }
 
 function agentCanAct(mode: PlayerMode) {
   return mode === "agent" || mode === "both";
+}
+
+function heuristicCanAct(mode: PlayerMode) {
+  return mode === "heuristic";
 }
 
 function userClicksAllowed(mode: PlayerMode) {
@@ -2277,12 +2473,24 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     "touchstart",
     "touchend"
   ];
+  const HEURISTIC_TICK_MS = 125;
+  const HEURISTIC_SKIP_PATTERN = /reset|restart|import|export|load|save|price|deposit|withdraw|investment/i;
+  const HEURISTIC_BUTTON_RULES = [
+    { pattern: /buy\s*wire|wire\s*buyer|wire/i, score: 95, cooldownMs: 650 },
+    { pattern: /project|hypno|probe|drone|factory|harvester|tournament|strategy/i, score: 90, cooldownMs: 1800 },
+    { pattern: /processor|memory|operations|op|compute|quantum/i, score: 82, cooldownMs: 1200 },
+    { pattern: /clipper|auto\s*clipper|mega\s*clipper/i, score: 78, cooldownMs: 900 },
+    { pattern: /marketing|demand/i, score: 64, cooldownMs: 2200 },
+    { pattern: /make\s*paperclip|btnmakepaperclip/i, score: 28, cooldownMs: 125 },
+    { pattern: /paperclip|clip/i, score: 12, cooldownMs: 125 }
+  ];
 
   let playerMode = "human";
   let playerReady = false;
   let allPlayersReady = false;
   let inputShield = null;
   let inputTooltip = null;
+  const heuristicCooldowns = new Map();
 
   const cssEscape = (value) => {
     if (window.CSS && typeof window.CSS.escape === "function") return window.CSS.escape(value);
@@ -2291,9 +2499,13 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
 
   const normalizeText = (value) => String(value || "").replace(/\s+/g, " ").trim();
   const agentCanAct = () => playerMode === "agent" || playerMode === "both";
-  const userInputLocked = () => !allPlayersReady || playerMode === "agent";
-  const inputLockMessage = () =>
-    !allPlayersReady ? "Both players must be ready first." : "Mouse input is locked while this player is Agent-only.";
+  const heuristicCanAct = () => playerMode === "heuristic";
+  const userInputLocked = () => !allPlayersReady || playerMode === "agent" || playerMode === "heuristic";
+  const inputLockMessage = () => {
+    if (!allPlayersReady) return "Both players must be ready first.";
+    if (playerMode === "heuristic") return "Mouse input is locked while heuristic AI is running.";
+    return "Mouse input is locked while this player is Agent-only.";
+  };
 
   const installStyles = () => {
     const style = document.createElement("style");
@@ -2488,7 +2700,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     );
 
   const setPlayerMode = (mode) => {
-    playerMode = mode === "agent" || mode === "both" ? mode : "human";
+    playerMode = mode === "agent" || mode === "both" || mode === "heuristic" ? mode : "human";
     document.documentElement.dataset.paperclipBattlerMode = playerMode;
     applyInputLock();
   };
@@ -2596,6 +2808,50 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
         }
       };
     });
+
+  const heuristicKey = (button) => normalizeText(button.id || button.text || button.selector).toLowerCase();
+
+  const heuristicDecisionForButton = (button) => {
+    if (!button.visible || button.disabled) return null;
+    const haystack = [button.id, button.text, button.title, button.value].map(normalizeText).join(" ");
+    if (!haystack || HEURISTIC_SKIP_PATTERN.test(haystack)) return null;
+
+    let best = button.text || button.id ? { score: 24, cooldownMs: 1400 } : null;
+    for (const rule of HEURISTIC_BUTTON_RULES) {
+      if (!rule.pattern.test(haystack)) continue;
+      if (!best || rule.score > best.score) best = rule;
+    }
+
+    return best;
+  };
+
+  const chooseHeuristicButton = () => {
+    const now = Date.now();
+    return collectButtons()
+      .map((button) => {
+        const decision = heuristicDecisionForButton(button);
+        if (!decision) return null;
+        const key = heuristicKey(button);
+        if ((heuristicCooldowns.get(key) || 0) > now) return null;
+        return { button, decision, key };
+      })
+      .filter(Boolean)
+      .sort((left, right) => right.decision.score - left.decision.score || left.button.index - right.button.index)[0];
+  };
+
+  const runHeuristicTick = () => {
+    if (!heuristicCanAct() || !allPlayersReady) return;
+    const target = chooseHeuristicButton();
+    if (!target) return;
+
+    const element = document.querySelector(target.button.selector);
+    if (!element || !visible(element) || element.disabled) return;
+
+    heuristicCooldowns.set(target.key, Date.now() + target.decision.cooldownMs);
+    animateMcpPress(element);
+    element.click();
+    window.setTimeout(report, 80);
+  };
 
   const findLabel = (element) => {
     if (element.id) {
@@ -2706,9 +2962,9 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     const result = { id: command.id, ok: true, message: "ok", at: Date.now() };
     try {
       await refreshConfig();
-      if (!agentCanAct()) throw new Error("This player is not in Agent or Both mode.");
 
       if (command.type === "click") {
+        if (!agentCanAct()) throw new Error("This player is not in Agent or Both mode.");
         if (!allPlayersReady) throw new Error(playerReady ? "Waiting for the other player to be ready before actions can run." : "You need to be ready before taking actions.");
         const button = findButton(command);
         if (!button) throw new Error("Button not found.");
@@ -2717,6 +2973,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
         button.click();
         result.message = "Clicked " + buttonText(button) + ".";
       } else if (command.type === "set-control") {
+        if (!agentCanAct()) throw new Error("This player is not in Agent or Both mode.");
         if (!allPlayersReady) throw new Error(playerReady ? "Waiting for the other player to be ready before actions can run." : "You need to be ready before taking actions.");
         const control = findControl(command);
         if (!control) throw new Error("Control not found.");
@@ -2790,5 +3047,6 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   window.setInterval(refreshConfig, 500);
   window.setInterval(report, 1000);
   window.setInterval(poll, 250);
+  window.setInterval(runHeuristicTick, HEURISTIC_TICK_MS);
 })();
 `;
