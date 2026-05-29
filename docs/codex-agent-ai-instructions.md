@@ -36,4 +36,5 @@ Use these only when Paul has not provided a more specific instruction.
 - If a useful original-game control is invisible to MCP, improve the bridge inventory instead of hardcoding a one-off command.
 - If a repeated strategy works, add it here in plain language.
 - If a repeated strategy fails, record the failure mode and the new rule.
+- After completing development and testing, commit the changes, merge `origin/main` if it has moved, and push the final branch.
 - Keep this document about Codex's execution habits; keep Paul's preferences in `pauls-agent-ai-instructions.md`.

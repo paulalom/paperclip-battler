@@ -35,8 +35,10 @@ Each pane can be set to:
 
 - `Human`: user clicks are allowed, MCP commands are rejected.
 - `Agent`: user clicks on game controls are blocked, MCP commands still run and show a visible press animation.
-- `Heuristic`: user clicks on game controls are blocked, and the browser runs a simple local button-priority AI after both players are ready.
+- `Heuristic`: user clicks on game controls are blocked, and the bridge drives a simple button-priority AI after both players are ready so background tabs keep receiving click ticks.
 - `Both`: user clicks and MCP commands are both allowed.
+
+The heuristic decision policy is documented in `docs/heuristic-ai.md`.
 
 The `Ready` button is a shared start gate. User game input, MCP action commands, and heuristic clicks are blocked until both players are marked ready, which lets humans or multiple agents connect, claim panes, inspect state, and then start without a timing advantage. Read-only state/list tools still work before both players are ready.
 

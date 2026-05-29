@@ -19,6 +19,9 @@ const ROOM_EVENT_HISTORY_LIMIT = 80;
 const DEFAULT_LOBBY_TTL_MS = Number(process.env.PAPERCLIP_DEFAULT_LOBBY_TTL_MS ?? 30 * 60 * 1000);
 const ROOM_PARTICIPANT_TTL_MS = Number(process.env.PAPERCLIP_ROOM_PARTICIPANT_TTL_MS ?? 15_000);
 const SPECTATOR_SAVE_SYNC_INTERVAL_MS = 5_000;
+const BRIDGE_HEURISTIC_DECISION_TICK_MS = Number(process.env.PAPERCLIP_HEURISTIC_DECISION_TICK_MS ?? 750);
+const BRIDGE_HEURISTIC_MANUAL_CLIP_TICK_MS = Number(process.env.PAPERCLIP_HEURISTIC_MANUAL_CLIP_TICK_MS ?? 125);
+const BRIDGE_HEURISTIC_TICK_HEARTBEAT_MS = 15_000;
 const MAX_JSON_BODY_SIZE = 5_000_000;
 const PAPERCLIP_CLICK_RATE_LIMIT_LABEL = "10 clicks per second per session";
 const RATE_LIMIT_CLEANUP_INTERVAL_MS = 60_000;
@@ -909,6 +912,13 @@ function startBridge() {
         touchRoom(roomId);
         emitRoomEvent(roomId, "snapshot", { player: getPlayerMeta(roomId, playerId), report: summarizeReport(report) });
         sendJson(response, 200, { ok: true });
+        return;
+      }
+
+      if (request.method === "GET" && (url.pathname === "/player-control/heuristic-ticks" || url.pathname === "/agent-control/heuristic-ticks")) {
+        const roomId = resolveUrlRoomId(url);
+        const playerId = normalizePlayerId(url.searchParams.get("player") ?? "right");
+        subscribeHeuristicTicks(roomId, playerId, request, response);
         return;
       }
 
@@ -2248,6 +2258,8 @@ function isPlayerControlPath(pathname: string) {
     pathname === "/agent-control/config" ||
     pathname === "/player-control/report" ||
     pathname === "/agent-control/report" ||
+    pathname === "/player-control/heuristic-ticks" ||
+    pathname === "/agent-control/heuristic-ticks" ||
     pathname === "/player-control/next-command" ||
     pathname === "/agent-control/next-command" ||
     pathname === "/player-control/result" ||
@@ -2404,6 +2416,78 @@ function normalizeStringRecord(value: unknown) {
   return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, String(item)]));
 }
 
+function subscribeHeuristicTicks(roomId: string, playerId: PlayerId, request: IncomingMessage, response: ServerResponse) {
+  response.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive"
+  });
+
+  let closed = false;
+  let lastDecisionAt = 0;
+  let tickTimer: ReturnType<typeof setInterval> | null = null;
+  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+
+  function cleanup() {
+    if (closed) return;
+    closed = true;
+    if (tickTimer) clearInterval(tickTimer);
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+  }
+
+  function writeEvent(type: string, payload: Record<string, unknown> = {}) {
+    if (closed) return;
+
+    try {
+      response.write(
+        `event: ${type}\ndata: ${JSON.stringify({
+          roomId,
+          playerId,
+          at: Date.now(),
+          ...payload
+        })}\n\n`
+      );
+    } catch {
+      cleanup();
+    }
+  }
+
+  function writeHeartbeat() {
+    if (closed) return;
+
+    try {
+      response.write(`: heuristic ${Date.now()}\n\n`);
+    } catch {
+      cleanup();
+    }
+  }
+
+  function tick() {
+    const state = getPlayerState(roomId, playerId);
+    const everyoneReady = allPlayersReady(roomId);
+    if (!heuristicCanAct(state.mode) || !everyoneReady) return;
+
+    const payload = {
+      mode: state.mode,
+      playerReady: state.ready,
+      allPlayersReady: everyoneReady
+    };
+    const now = Date.now();
+
+    writeEvent("manual-paperclip", payload);
+    if (now - lastDecisionAt >= BRIDGE_HEURISTIC_DECISION_TICK_MS) {
+      lastDecisionAt = now;
+      writeEvent("decision", payload);
+    }
+  }
+
+  writeHeartbeat();
+  tickTimer = setInterval(tick, BRIDGE_HEURISTIC_MANUAL_CLIP_TICK_MS);
+  heartbeatTimer = setInterval(writeHeartbeat, BRIDGE_HEURISTIC_TICK_HEARTBEAT_MS);
+
+  request.on("close", cleanup);
+}
+
 function subscribeRoomEvents(roomId: string, request: IncomingMessage, response: ServerResponse) {
   const room = getRoomState(roomId);
   response.writeHead(200, {
@@ -2515,6 +2599,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   const REPORT_URL = "/player-control/report?" + ROOM_QUERY;
   const COMMAND_URL = "/player-control/next-command?" + ROOM_QUERY;
   const RESULT_URL = "/player-control/result?" + ROOM_QUERY;
+  const HEURISTIC_TICK_URL = "/player-control/heuristic-ticks?" + ROOM_QUERY;
   const INTERACTIVE_SELECTOR =
     'button,input:not([type="hidden"]),select,textarea,a[onclick],[role="button"]';
   const SHIELD_EVENTS = [
@@ -2529,12 +2614,18 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     "touchstart",
     "touchend"
   ];
-  const HEURISTIC_DECISION_TICK_MS = 250;
+  const HEURISTIC_DECISION_TICK_MS = 750;
   const HEURISTIC_MANUAL_CLIP_TICK_MS = 125;
+  const HEURISTIC_BRIDGE_TICK_STALE_MS = 2000;
   const REPORT_MIN_INTERVAL_MS = 500;
+  const HEURISTIC_WIRE_BUY_COOLDOWN_MS = 750;
+  const HEURISTIC_WIRE_LOW_PRICE_RULES = [
+    { maxCost: 10, targetWire: 10000 },
+    { maxCost: 12, targetWire: 5000 },
+    { maxCost: 14, targetWire: 2000 }
+  ];
   const HEURISTIC_SKIP_PATTERN = /reset|restart|import|export|load|save|price|deposit|withdraw|investment/i;
   const HEURISTIC_BUTTON_RULES = [
-    { pattern: /buy\s*wire|wire\s*buyer|wire/i, score: 95, cooldownMs: 650 },
     { pattern: /project|hypno|probe|drone|factory|harvester|tournament|strategy/i, score: 90, cooldownMs: 1800 },
     { pattern: /processor|memory|operations|op|compute|quantum/i, score: 82, cooldownMs: 1200 },
     { pattern: /clipper|auto\s*clipper|mega\s*clipper/i, score: 78, cooldownMs: 900 },
@@ -2553,7 +2644,9 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   let reportAgainAfterInFlight = false;
   let pollInFlight = false;
   let lastReportAt = 0;
+  let lastBridgeHeuristicTickAt = 0;
   let suppressClickReportUntil = 0;
+  let heuristicTickStream = null;
   const heuristicCooldowns = new Map();
 
   const cssEscape = (value) => {
@@ -2815,6 +2908,37 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     }
   };
 
+  const bridgeHeuristicTicksFresh = () => Date.now() - lastBridgeHeuristicTickAt < HEURISTIC_BRIDGE_TICK_STALE_MS;
+
+  const applyBridgeHeuristicTick = (event) => {
+    lastBridgeHeuristicTickAt = Date.now();
+
+    try {
+      const payload = JSON.parse(event.data || "{}");
+      if (payload?.mode) setPlayerMode(payload.mode);
+      if (typeof payload?.allPlayersReady === "boolean") setReadyState(payload.playerReady, payload.allPlayersReady);
+    } catch {
+      // Keep heuristic input moving even if a transient bridge event is malformed.
+    }
+  };
+
+  const startHeuristicTickStream = () => {
+    if (!window.EventSource || heuristicTickStream) return;
+
+    heuristicTickStream = new EventSource(HEURISTIC_TICK_URL);
+    heuristicTickStream.addEventListener("manual-paperclip", (event) => {
+      applyBridgeHeuristicTick(event);
+      runManualPaperclipTick();
+    });
+    heuristicTickStream.addEventListener("decision", (event) => {
+      applyBridgeHeuristicTick(event);
+      runHeuristicTick();
+    });
+    heuristicTickStream.onerror = () => {
+      if (heuristicTickStream?.readyState === EventSource.CLOSED) heuristicTickStream = null;
+    };
+  };
+
   const closestInteractive = (target) =>
     target instanceof Element ? target.closest(INTERACTIVE_SELECTOR) : null;
 
@@ -2881,15 +3005,65 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     normalizeText(button.id).toLowerCase() === "btnmakepaperclip" ||
     normalizeText(button.text).toLowerCase() === "make paperclip";
 
+  const isBuyWireButton = (button) => normalizeText(button.id).toLowerCase() === "btnbuywire";
+
   const manualPaperclipElement = () =>
     document.getElementById("btnMakePaperclip") ||
     buttonElements().find((element) => normalizeText(buttonText(element)).toLowerCase() === "make paperclip");
+
+  const parseGameNumber = (value) => {
+    const parsed = Number.parseFloat(String(value || "").replace(/,/g, "").replace(/[^0-9.+-]/g, ""));
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+
+  const clickHeuristicElement = (element, cooldownKey, cooldownMs) => {
+    if (!element || !visible(element) || element.disabled) return false;
+    const now = Date.now();
+    if ((heuristicCooldowns.get(cooldownKey) || 0) > now) return false;
+
+    heuristicCooldowns.set(cooldownKey, now + cooldownMs);
+    animateMcpPress(element);
+    element.click();
+    scheduleReport(80);
+    return true;
+  };
+
+  const runWireHeuristic = () => {
+    const wire = parseGameNumber(document.getElementById("wire")?.textContent);
+    const buyWireButton = document.getElementById("btnBuyWire");
+
+    if (wire !== null && wire <= 0) {
+      return clickHeuristicElement(buyWireButton, "wire:empty", HEURISTIC_WIRE_BUY_COOLDOWN_MS);
+    }
+
+    const wireCost = parseGameNumber(document.getElementById("wireCost")?.textContent);
+    const lowPriceRule = HEURISTIC_WIRE_LOW_PRICE_RULES.find((rule) => wireCost !== null && wireCost <= rule.maxCost);
+    if (!lowPriceRule || wire === null || wire >= lowPriceRule.targetWire) return false;
+
+    return clickHeuristicElement(buyWireButton, "wire:low:" + lowPriceRule.maxCost, HEURISTIC_WIRE_BUY_COOLDOWN_MS);
+  };
+
+  const runPriceHeuristic = () => {
+    const unsoldClips = parseGameNumber(document.getElementById("unsoldClips")?.textContent);
+    if (unsoldClips === null) return false;
+
+    if (unsoldClips > 150) {
+      return clickHeuristicElement(document.getElementById("btnLowerPrice"), "price:lower", 750);
+    }
+
+    if (unsoldClips < 50) {
+      return clickHeuristicElement(document.getElementById("btnRaisePrice"), "price:raise", 750);
+    }
+
+    return false;
+  };
 
   const heuristicKey = (button) => normalizeText(button.id || button.text || button.selector).toLowerCase();
 
   const heuristicDecisionForButton = (button) => {
     if (!button.visible || button.disabled) return null;
     if (isManualPaperclipButton(button)) return null;
+    if (isBuyWireButton(button)) return null;
     const haystack = [button.id, button.text, button.title, button.value].map(normalizeText).join(" ");
     if (!haystack || HEURISTIC_SKIP_PATTERN.test(haystack)) return null;
 
@@ -2918,16 +3092,14 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
 
   const runHeuristicTick = () => {
     if (!heuristicCanAct() || !allPlayersReady) return;
+    if (runWireHeuristic()) return;
+    if (runPriceHeuristic()) return;
+
     const target = chooseHeuristicButton();
     if (!target) return;
 
     const element = document.querySelector(target.button.selector);
-    if (!element || !visible(element) || element.disabled) return;
-
-    heuristicCooldowns.set(target.key, Date.now() + target.decision.cooldownMs);
-    animateMcpPress(element);
-    element.click();
-    scheduleReport(80);
+    clickHeuristicElement(element, target.key, target.decision.cooldownMs);
   };
 
   const runManualPaperclipTick = () => {
@@ -3141,6 +3313,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   setReadyState(false, false);
   refreshConfig();
   report();
+  startHeuristicTickStream();
   window.addEventListener("load", report);
   window.addEventListener("click", () => {
     if (Date.now() < suppressClickReportUntil) return;
@@ -3164,7 +3337,11 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   window.setInterval(refreshConfig, 500);
   window.setInterval(report, 1000);
   window.setInterval(poll, 250);
-  window.setInterval(runHeuristicTick, HEURISTIC_DECISION_TICK_MS);
-  window.setInterval(runManualPaperclipTick, HEURISTIC_MANUAL_CLIP_TICK_MS);
+  window.setInterval(() => {
+    if (!bridgeHeuristicTicksFresh()) runHeuristicTick();
+  }, HEURISTIC_DECISION_TICK_MS);
+  window.setInterval(() => {
+    if (!bridgeHeuristicTicksFresh()) runManualPaperclipTick();
+  }, HEURISTIC_MANUAL_CLIP_TICK_MS);
 })();
 `;
