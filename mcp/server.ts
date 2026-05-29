@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -22,6 +25,12 @@ const SPECTATOR_SAVE_SYNC_INTERVAL_MS = 5_000;
 const BRIDGE_HEURISTIC_DECISION_TICK_MS = Number(process.env.PAPERCLIP_HEURISTIC_DECISION_TICK_MS ?? 750);
 const BRIDGE_HEURISTIC_MANUAL_CLIP_TICK_MS = Number(process.env.PAPERCLIP_HEURISTIC_MANUAL_CLIP_TICK_MS ?? 125);
 const BRIDGE_HEURISTIC_TICK_HEARTBEAT_MS = 15_000;
+const DEFAULT_ATTRACT_TITLE = process.env.PAPERCLIP_DEFAULT_ATTRACT_TITLE ?? "Paperclip Battler";
+const DEFAULT_ATTRACT_ENABLED = !["0", "false", "no", "off"].includes(
+  String(process.env.PAPERCLIP_DEFAULT_ATTRACT ?? "1").toLowerCase()
+);
+const DEFAULT_ATTRACT_RESTART_DELAY_MS = Number(process.env.PAPERCLIP_DEFAULT_ATTRACT_RESTART_DELAY_MS ?? 1_000);
+const ATTRACT_BROWSER_RESTART_MS = Number(process.env.PAPERCLIP_ATTRACT_BROWSER_RESTART_MS ?? 3_000);
 const MAX_JSON_BODY_SIZE = 5_000_000;
 const PAPERCLIP_CLICK_RATE_LIMIT_LABEL = "10 clicks per second per session";
 const RATE_LIMIT_CLEANUP_INTERVAL_MS = 60_000;
@@ -277,10 +286,28 @@ type RoomState = {
   sseClients: Set<ServerResponse>;
 };
 
+type BrowserCommand = {
+  command: string;
+  args: string[];
+};
+
+type DefaultAttractRuntime = {
+  roomId: string;
+  browsers: Array<ReturnType<typeof spawn>>;
+  profileDirs: string[];
+  startedAt: number;
+  stopping: boolean;
+  gameOverAt: number | null;
+  lastError: string | null;
+  restartTimer: ReturnType<typeof setTimeout> | null;
+};
+
 const rooms = new Map<string, RoomState>([[DEFAULT_ROOM_ID, createRoomState(DEFAULT_ROOM_ID, "Local Room")]]);
 
 let instructionMode: InstructionMode = "none";
 let defaultLobby: { roomId: string; createdAt: number } | null = null;
+let defaultAttractRuntime: DefaultAttractRuntime | null = null;
+let defaultAttractLaunch: Promise<void> | null = null;
 let lastRateLimitCleanupAt = Date.now();
 const rateLimitBuckets = new Map<string, RateLimitBucket>();
 const commandWaiters = new Map<string, (result: AgentCommandResult) => void>();
@@ -647,6 +674,13 @@ startBridge();
 
 const transport = new StdioServerTransport();
 await mcpServer.connect(transport);
+process.once("SIGINT", shutdownBridgeProcess);
+process.once("SIGTERM", shutdownBridgeProcess);
+
+function shutdownBridgeProcess() {
+  stopDefaultAttractRuntime();
+  process.exit(0);
+}
 
 function startBridge() {
   const server = createServer(async (request, response) => {
@@ -911,6 +945,7 @@ function startBridge() {
         getPlayerState(roomId, playerId).latestReport = report;
         touchRoom(roomId);
         emitRoomEvent(roomId, "snapshot", { player: getPlayerMeta(roomId, playerId), report: summarizeReport(report) });
+        handleDefaultAttractReport(roomId, playerId, report);
         sendJson(response, 200, { ok: true });
         return;
       }
@@ -1500,11 +1535,14 @@ function getDefaultLobbyRoom() {
     return rotateDefaultLobby(undefined, now);
   }
 
-  return getRoomState(defaultLobby.roomId);
+  const room = getRoomState(defaultLobby.roomId);
+  ensureDefaultAttractRoom(room);
+  return room;
 }
 
 function shouldRotateDefaultLobby(now = Date.now()) {
   if (!defaultLobby) return true;
+  if (DEFAULT_ATTRACT_ENABLED && defaultAttractRuntime?.roomId === defaultLobby.roomId) return false;
   const room = getRoomState(defaultLobby.roomId);
   const activePlayers = getActiveRoomParticipants(room, now).filter((participant) => participant.role === "player").length;
   return activePlayers === 0 && now - defaultLobby.createdAt >= DEFAULT_LOBBY_TTL_MS;
@@ -1512,8 +1550,10 @@ function shouldRotateDefaultLobby(now = Date.now()) {
 
 function rotateDefaultLobby(title?: unknown, now = Date.now()) {
   const roomId = createShortRoomId();
-  const room = getRoomState(roomId, normalizeRoomTitle(title, roomId));
+  const room = getRoomState(roomId, normalizeRoomTitle(title ?? DEFAULT_ATTRACT_TITLE, roomId));
+  stopDefaultAttractRuntime();
   defaultLobby = { roomId, createdAt: now };
+  ensureDefaultAttractRoom(room);
   touchRoom(roomId);
   emitRoomEvent(roomId, "room", { room: serializeRoom(roomId), lobby: "default" });
   return room;
@@ -1527,10 +1567,285 @@ function serializeDefaultLobby(room: RoomState) {
       roomId: room.id,
       createdAt,
       rotatesAfterMs: DEFAULT_LOBBY_TTL_MS,
-      participantTtlMs: ROOM_PARTICIPANT_TTL_MS
+      participantTtlMs: ROOM_PARTICIPANT_TTL_MS,
+      attract: serializeDefaultAttractRuntime()
     },
     room: serializeRoom(room.id)
   };
+}
+
+function ensureDefaultAttractRoom(room: RoomState) {
+  if (!DEFAULT_ATTRACT_ENABLED) return;
+
+  let changed = false;
+  for (const playerId of PLAYER_IDS) {
+    const state = getPlayerState(room.id, playerId);
+    if (state.mode !== "heuristic") {
+      state.mode = "heuristic";
+      changed = true;
+    }
+    if (!state.ready) {
+      state.ready = true;
+      changed = true;
+    }
+    if (state.claim) {
+      state.claim = null;
+      changed = true;
+    }
+  }
+
+  if (changed) touchRoom(room.id);
+  void ensureDefaultAttractRuntime(room.id);
+}
+
+function serializeDefaultAttractRuntime() {
+  const running = Boolean(
+    defaultAttractRuntime?.browsers.length && defaultAttractRuntime.browsers.every((browser) => browser.exitCode === null)
+  );
+  return {
+    enabled: DEFAULT_ATTRACT_ENABLED,
+    roomId: defaultAttractRuntime?.roomId ?? null,
+    running,
+    startedAt: defaultAttractRuntime?.startedAt ?? null,
+    lastError: defaultAttractRuntime?.lastError ?? null,
+    restartDelayMs: DEFAULT_ATTRACT_RESTART_DELAY_MS
+  };
+}
+
+async function ensureDefaultAttractRuntime(roomId: string, force = false) {
+  if (!DEFAULT_ATTRACT_ENABLED) return;
+  if (defaultAttractLaunch) {
+    await defaultAttractLaunch;
+    if (
+      !force &&
+      defaultAttractRuntime?.roomId === roomId &&
+      defaultAttractRuntime.browsers.length > 0 &&
+      defaultAttractRuntime.browsers.every((browser) => browser.exitCode === null)
+    ) {
+      return;
+    }
+  }
+
+  if (
+    !force &&
+    defaultAttractRuntime?.roomId === roomId &&
+    (defaultAttractRuntime.browsers.some((browser) => browser.exitCode === null) ||
+      defaultAttractRuntime.restartTimer ||
+      defaultAttractRuntime.lastError)
+  ) {
+    return;
+  }
+
+  defaultAttractLaunch = startDefaultAttractRuntime(roomId).finally(() => {
+    defaultAttractLaunch = null;
+  });
+  await defaultAttractLaunch;
+}
+
+async function startDefaultAttractRuntime(roomId: string) {
+  stopDefaultAttractRuntime();
+  const browserCommand = resolveAttractBrowserCommand();
+  if (!browserCommand) {
+    defaultAttractRuntime = {
+      roomId,
+      browsers: [],
+      profileDirs: [],
+      startedAt: Date.now(),
+      stopping: false,
+      gameOverAt: null,
+      lastError: "No Chrome, Edge, or Chromium executable was found for default attract mode.",
+      restartTimer: null
+    };
+    emitRoomEvent(roomId, "attract-error", { roomId, message: defaultAttractRuntime.lastError });
+    return;
+  }
+
+  const runtime: DefaultAttractRuntime = {
+    roomId,
+    browsers: [],
+    profileDirs: [],
+    startedAt: Date.now(),
+    stopping: false,
+    gameOverAt: null,
+    lastError: null,
+    restartTimer: null
+  };
+  defaultAttractRuntime = runtime;
+
+  for (const playerId of PLAYER_IDS) {
+    const profileDir = await mkdtemp(join(tmpdir(), `paperclip-battler-${roomId}-${playerId}-`));
+    const playerUrl = `http://127.0.0.1:${BRIDGE_PORT}/rooms/${roomId}/players/${playerId}/${ORIGINAL_ENTRY}?attract=1`;
+    const browserArgs = [
+      ...browserCommand.args,
+      "--headless=new",
+      "--disable-gpu",
+      "--disable-background-timer-throttling",
+      "--disable-backgrounding-occluded-windows",
+      "--disable-renderer-backgrounding",
+      "--disable-features=CalculateNativeWinOcclusion",
+      "--no-first-run",
+      "--no-default-browser-check",
+      `--user-data-dir=${profileDir}`,
+      playerUrl
+    ];
+    const browser = spawn(browserCommand.command, browserArgs, {
+      stdio: ["ignore", "ignore", "pipe"],
+      windowsHide: true
+    });
+
+    runtime.browsers.push(browser);
+    runtime.profileDirs.push(profileDir);
+
+    browser.stderr?.on("data", (chunk) => {
+      const message = String(chunk).trim();
+      if (message) runtime.lastError = message.slice(-500);
+    });
+
+    browser.once("error", (error) => {
+      runtime.lastError = error instanceof Error ? error.message : "Attract browser failed to start.";
+      emitRoomEvent(roomId, "attract-error", { roomId, playerId, message: runtime.lastError });
+      void cleanupAttractProfile(profileDir);
+      scheduleDefaultAttractRestart(roomId);
+    });
+
+    browser.once("exit", () => {
+      void cleanupAttractProfile(profileDir);
+      if (defaultAttractRuntime === runtime && !runtime.stopping && !runtime.gameOverAt) {
+        scheduleDefaultAttractRestart(roomId);
+      }
+    });
+  }
+
+  emitRoomEvent(roomId, "room", { room: serializeRoom(roomId), lobby: "default", attract: serializeDefaultAttractRuntime() });
+}
+
+function stopDefaultAttractRuntime(roomId?: string) {
+  const runtime = defaultAttractRuntime;
+  if (!runtime || (roomId && runtime.roomId !== roomId)) return;
+
+  runtime.stopping = true;
+  if (runtime.restartTimer) {
+    clearTimeout(runtime.restartTimer);
+    runtime.restartTimer = null;
+  }
+  for (const browser of runtime.browsers) {
+    if (browser.exitCode === null) browser.kill();
+  }
+  if (runtime.browsers.every((browser) => browser.exitCode !== null)) {
+    for (const profileDir of runtime.profileDirs) {
+      void cleanupAttractProfile(profileDir);
+    }
+  }
+  if (defaultAttractRuntime === runtime) defaultAttractRuntime = null;
+}
+
+function scheduleDefaultAttractRestart(roomId: string) {
+  if (!DEFAULT_ATTRACT_ENABLED || defaultLobby?.roomId !== roomId) return;
+  const runtime = defaultAttractRuntime;
+  if (!runtime || runtime.roomId !== roomId || runtime.stopping || runtime.gameOverAt || runtime.restartTimer) return;
+
+  runtime.restartTimer = setTimeout(() => {
+    runtime.restartTimer = null;
+    void ensureDefaultAttractRuntime(roomId, true);
+  }, ATTRACT_BROWSER_RESTART_MS);
+}
+
+async function cleanupAttractProfile(profileDir: string) {
+  try {
+    await rm(profileDir, { recursive: true, force: true });
+  } catch {
+    // Temporary browser profiles are best-effort cleanup.
+  }
+}
+
+function resolveAttractBrowserCommand(): BrowserCommand | null {
+  const configured = process.env.PAPERCLIP_ATTRACT_BROWSER_PATH?.trim();
+  if (configured) return { command: configured, args: parseBrowserArgs(process.env.PAPERCLIP_ATTRACT_BROWSER_ARGS) };
+
+  const candidates = getAttractBrowserCandidates();
+  const existing = candidates.find((candidate) => {
+    const isPath = candidate.includes("/") || candidate.includes("\\");
+    return isPath && existsSync(candidate);
+  });
+  if (existing) return { command: existing, args: [] };
+
+  const pathCandidates =
+    process.platform === "win32"
+      ? ["msedge.exe", "chrome.exe"]
+      : process.platform === "darwin"
+        ? []
+        : ["google-chrome", "chromium", "chromium-browser", "microsoft-edge"];
+  return pathCandidates.length ? { command: pathCandidates[0], args: [] } : null;
+}
+
+function parseBrowserArgs(value: unknown) {
+  if (typeof value !== "string" || !value.trim()) return [];
+  return value.match(/(?:[^\s"]+|"[^"]*")+/g)?.map((part) => part.replace(/^"|"$/g, "")) ?? [];
+}
+
+function getAttractBrowserCandidates() {
+  if (process.platform === "win32") {
+    return [
+      process.env.PROGRAMFILES ? join(process.env.PROGRAMFILES, "Microsoft", "Edge", "Application", "msedge.exe") : "",
+      process.env["PROGRAMFILES(X86)"] ? join(process.env["PROGRAMFILES(X86)"], "Microsoft", "Edge", "Application", "msedge.exe") : "",
+      process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, "Microsoft", "Edge", "Application", "msedge.exe") : "",
+      process.env.PROGRAMFILES ? join(process.env.PROGRAMFILES, "Google", "Chrome", "Application", "chrome.exe") : "",
+      process.env["PROGRAMFILES(X86)"] ? join(process.env["PROGRAMFILES(X86)"], "Google", "Chrome", "Application", "chrome.exe") : "",
+      process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, "Google", "Chrome", "Application", "chrome.exe") : ""
+    ].filter(Boolean);
+  }
+
+  if (process.platform === "darwin") {
+    return [
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+      "/Applications/Chromium.app/Contents/MacOS/Chromium"
+    ];
+  }
+
+  return ["/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/microsoft-edge"];
+}
+
+function handleDefaultAttractReport(roomId: string, playerId: PlayerId, report: AgentReport) {
+  if (!DEFAULT_ATTRACT_ENABLED || defaultLobby?.roomId !== roomId || defaultAttractRuntime?.roomId !== roomId) return;
+  if (defaultAttractRuntime.gameOverAt) return;
+
+  const result = detectGameWinner(report);
+  if (!result) return;
+
+  defaultAttractRuntime.gameOverAt = Date.now();
+  const nextRoom = rotateDefaultLobby(DEFAULT_ATTRACT_TITLE);
+  const payload = {
+    winner: playerId,
+    winnerLabel: PLAYER_LABELS[playerId],
+    message: `${PLAYER_LABELS[playerId]} wins`,
+    reason: result.reason,
+    nextRoomId: nextRoom.id,
+    restartDelayMs: DEFAULT_ATTRACT_RESTART_DELAY_MS
+  };
+  emitRoomEvent(roomId, "game-over", payload);
+}
+
+function detectGameWinner(report: AgentReport) {
+  const text = report.visibleText.toLowerCase();
+  const visibleButtonText = report.buttons
+    .filter((button) => button.visible)
+    .map((button) => `${button.id} ${button.text} ${button.title} ${button.value}`.toLowerCase())
+    .join(" ");
+
+  if (/all matter.*converted.*paperclips/.test(text) || /universe.*converted.*paperclips/.test(text)) {
+    return { reason: "All matter converted to paperclips." };
+  }
+
+  if (/\byou (win|won)\b/.test(text) && /paperclip|universe|matter/.test(text)) {
+    return { reason: "Victory text detected." };
+  }
+
+  if (/restart/.test(visibleButtonText) && /universe|matter|paperclips/.test(text) && /100(?:\.0+)?%/.test(text)) {
+    return { reason: "Endgame restart control detected." };
+  }
+
+  return null;
 }
 
 function serializeRoom(roomId: string) {

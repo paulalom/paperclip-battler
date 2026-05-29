@@ -156,6 +156,19 @@ type AppRoute = {
   embedded: boolean;
   defaultLobby: boolean;
 };
+type RoomEvent = {
+  id: number;
+  roomId: string;
+  type: string;
+  at: number;
+  payload?: unknown;
+};
+type WinnerOverlay = {
+  winner: PlayerId;
+  message: string;
+  nextRoomId: string | null;
+  restartDelayMs: number;
+};
 
 function notifyEmbeddedHost(roomId: string, view: RoomView) {
   if (window.parent === window) return;
@@ -173,6 +186,39 @@ function notifyEmbeddedHost(roomId: string, view: RoomView) {
   );
 }
 
+function parseGameOverPayload(event: MessageEvent): WinnerOverlay | null {
+  try {
+    const roomEvent = JSON.parse(event.data) as RoomEvent;
+    const payload = roomEvent.payload;
+    if (!roomEvent || roomEvent.type !== "game-over" || !isRecordValue(payload)) return null;
+    const winner = normalizeWinnerPlayer(payload.winner);
+    if (!winner) return null;
+
+    const nextRoomId = typeof payload.nextRoomId === "string" ? normalizeRoomId(payload.nextRoomId) : null;
+    const restartDelayMs =
+      typeof payload.restartDelayMs === "number" && Number.isFinite(payload.restartDelayMs)
+        ? Math.max(250, payload.restartDelayMs)
+        : 1000;
+
+    return {
+      winner,
+      message: typeof payload.message === "string" ? payload.message : `${PLAYER_LABELS[winner]} wins`,
+      nextRoomId,
+      restartDelayMs
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function normalizeWinnerPlayer(value: unknown): PlayerId | null {
+  return value === "left" || value === "right" ? value : null;
+}
+
 export function App() {
   const initialRoute = readRoomRoute();
   const [bridgeUrl, setBridgeUrl] = useState(() => readInitialBridgeUrl());
@@ -182,11 +228,13 @@ export function App() {
   const [roomView, setRoomView] = useState<RoomView>(() => initialRoute.view);
   const [embedded, setEmbedded] = useState(() => initialRoute.embedded);
   const [useDefaultLobby, setUseDefaultLobby] = useState(() => initialRoute.defaultLobby);
+  const [followDefaultLobby, setFollowDefaultLobby] = useState(() => initialRoute.defaultLobby);
   const [roomNotice, setRoomNotice] = useState("");
   const [playerModes, setPlayerModes] = useState<Record<PlayerId, PlayerMode>>(readPlayerModes);
   const [health, setHealth] = useState<BridgeHealth | null>(null);
   const [status, setStatus] = useState<BridgeStatus>("checking");
   const [roomParticipant, setRoomParticipant] = useState<BridgeRoomParticipant | null>(null);
+  const [winnerOverlay, setWinnerOverlay] = useState<WinnerOverlay | null>(null);
   const importInputRef = useRef<HTMLInputElement>(null);
   const leftFrame = useRef<HTMLIFrameElement>(null);
   const rightFrame = useRef<HTMLIFrameElement>(null);
@@ -221,6 +269,8 @@ export function App() {
       setRoomView(nextRoute.view);
       setEmbedded(nextRoute.embedded);
       setUseDefaultLobby(nextRoute.defaultLobby);
+      setFollowDefaultLobby(nextRoute.defaultLobby);
+      setWinnerOverlay(null);
     };
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
@@ -244,10 +294,11 @@ export function App() {
         if (!payload.room?.id) throw new Error("Bridge did not return a lobby room.");
         if (cancelled) return;
         setRoomId(payload.room.id);
-        setRoomView("play");
+        setRoomView(roomView);
         setUseDefaultLobby(false);
+        setFollowDefaultLobby(true);
         setRoomNotice(`Lobby ${payload.room.id} ready`);
-        window.history.replaceState({}, "", roomRoutePath(payload.room.id, "play", embedded));
+        window.history.replaceState({}, "", roomRoutePath(payload.room.id, roomView, embedded));
       } catch {
         if (!cancelled) {
           setStatus("offline");
@@ -261,7 +312,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [embedded, trimmedBridgeUrl, useDefaultLobby]);
+  }, [embedded, roomView, trimmedBridgeUrl, useDefaultLobby]);
 
   useEffect(() => {
     if (useDefaultLobby) return undefined;
@@ -270,6 +321,7 @@ export function App() {
 
     async function syncModes() {
       try {
+        if (roomView === "watch") return;
         if (usesRoomSlots) {
           if (roomParticipant?.role !== "player" || !roomParticipant.player) return;
           await syncPlayerModeToBridge(trimmedBridgeUrl, roomId, roomParticipant.player, playerModes[roomParticipant.player]);
@@ -285,7 +337,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [playerModes, roomId, roomParticipant?.player, roomParticipant?.role, trimmedBridgeUrl, useDefaultLobby, usesRoomSlots]);
+  }, [playerModes, roomId, roomParticipant?.player, roomParticipant?.role, roomView, trimmedBridgeUrl, useDefaultLobby, usesRoomSlots]);
 
   useEffect(() => {
     if (useDefaultLobby) return undefined;
@@ -298,7 +350,9 @@ export function App() {
         if (!response.ok) throw new Error(`Bridge returned ${response.status}`);
         let nextHealth = (await response.json()) as BridgeHealth;
         const managedPlayerIds =
-          usesRoomSlots && roomParticipant?.role === "player" && roomParticipant.player
+          roomView === "watch"
+            ? []
+            : usesRoomSlots && roomParticipant?.role === "player" && roomParticipant.player
             ? [roomParticipant.player]
             : usesRoomSlots
               ? []
@@ -345,17 +399,43 @@ export function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [playerModes, roomId, roomParticipant?.player, roomParticipant?.role, trimmedBridgeUrl, useDefaultLobby, usesRoomSlots]);
+  }, [playerModes, roomId, roomParticipant?.player, roomParticipant?.role, roomView, trimmedBridgeUrl, useDefaultLobby, usesRoomSlots]);
 
   useEffect(() => {
     if (!roomId || useDefaultLobby) return undefined;
+    let restartTimer: number | null = null;
     const events = new EventSource(`${trimmedBridgeUrl}/rooms/${encodeURIComponent(roomId)}/events`);
     const markConnected = () => setStatus((current) => (current === "offline" ? "checking" : current));
+    const handleGameOver = (event: MessageEvent) => {
+      const payload = parseGameOverPayload(event);
+      if (!payload) return;
+
+      setWinnerOverlay(payload);
+      if (!followDefaultLobby || !payload.nextRoomId) return;
+
+      const nextRoomId = payload.nextRoomId;
+      restartTimer = window.setTimeout(() => {
+        setUseDefaultLobby(false);
+        setFollowDefaultLobby(true);
+        setRoomId(nextRoomId);
+        setRoomView(roomView);
+        setWinnerOverlay(null);
+        window.history.replaceState({}, "", roomRoutePath(nextRoomId, roomView, embedded));
+      }, payload.restartDelayMs);
+    };
     events.addEventListener("snapshot", markConnected);
     events.addEventListener("room", markConnected);
+    events.addEventListener("game-over", handleGameOver);
     events.onerror = () => events.close();
-    return () => events.close();
-  }, [roomId, trimmedBridgeUrl, useDefaultLobby]);
+    return () => {
+      if (restartTimer !== null) window.clearTimeout(restartTimer);
+      events.close();
+    };
+  }, [embedded, followDefaultLobby, roomId, roomView, trimmedBridgeUrl, useDefaultLobby]);
+
+  useEffect(() => {
+    setWinnerOverlay(null);
+  }, [roomId]);
 
   useEffect(() => {
     if (!usesRoomSlots || !roomId) {
@@ -525,6 +605,8 @@ export function App() {
   function navigateRoom(nextRoomId: string, nextView: RoomView, options: { replace?: boolean } = {}) {
     const normalized = normalizeRoomId(nextRoomId);
     setUseDefaultLobby(false);
+    setFollowDefaultLobby(false);
+    setWinnerOverlay(null);
     setRoomId(normalized);
     setRoomView(nextView);
     const nextPath = roomRoutePath(normalized, nextView, embedded);
@@ -676,7 +758,13 @@ export function App() {
       ) : waitingForSlot ? (
         <LobbyStatusView message={status === "offline" ? "Room bridge offline" : "Joining lobby"} />
       ) : roomView === "watch" || observerMode ? (
-        <WatchView health={health} status={status} playerModes={playerModes} sourceForPlayer={spectatorUrl} />
+        <WatchView
+          health={health}
+          status={status}
+          playerModes={playerModes}
+          sourceForPlayer={spectatorUrl}
+          winnerOverlay={winnerOverlay}
+        />
       ) : assignedPlayer ? (
         <section className="split-view">
           {PLAYER_IDS.map((playerId) => {
@@ -698,6 +786,7 @@ export function App() {
                 onReload={isAssignedPlayer ? () => reloadPlayer(playerId) : noop}
                 onReset={isAssignedPlayer ? () => resetPlayer(playerId) : noop}
                 onReleaseClaim={isAssignedPlayer ? () => releasePlayerClaim(playerId) : noop}
+                winnerMessage={winnerOverlay?.winner === playerId ? winnerOverlay.message : null}
               />
             );
           })}
@@ -719,6 +808,7 @@ export function App() {
               onReload={() => reloadPlayer(playerId)}
               onReset={() => resetPlayer(playerId)}
               onReleaseClaim={() => releasePlayerClaim(playerId)}
+              winnerMessage={winnerOverlay?.winner === playerId ? winnerOverlay.message : null}
             />
           ))}
         </section>
@@ -731,12 +821,14 @@ function WatchView({
   health,
   status,
   playerModes,
-  sourceForPlayer
+  sourceForPlayer,
+  winnerOverlay
 }: {
   health: BridgeHealth | null;
   status: BridgeStatus;
   playerModes: Record<PlayerId, PlayerMode>;
   sourceForPlayer: (playerId: PlayerId) => string;
+  winnerOverlay: WinnerOverlay | null;
 }) {
   const noop = () => undefined;
   return (
@@ -756,6 +848,7 @@ function WatchView({
           onReload={noop}
           onReset={noop}
           onReleaseClaim={noop}
+          winnerMessage={winnerOverlay?.winner === playerId ? winnerOverlay.message : null}
         />
       ))}
     </section>
@@ -812,6 +905,7 @@ function OriginalPane({
   onReload,
   onReset,
   onReleaseClaim,
+  winnerMessage,
   readOnly = false
 }: {
   title: string;
@@ -826,6 +920,7 @@ function OriginalPane({
   onReload: () => void;
   onReset: () => void;
   onReleaseClaim: () => void;
+  winnerMessage?: string | null;
   readOnly?: boolean;
 }) {
   const connected = Boolean(health?.connected);
@@ -913,6 +1008,11 @@ function OriginalPane({
         </div>
       </div>
       <iframe ref={frameRef} src={source} title={`${title} Universal Paperclips`} />
+      {winnerMessage ? (
+        <div className="winner-overlay" role="status" aria-live="polite">
+          <span>{winnerMessage}</span>
+        </div>
+      ) : null}
     </article>
   );
 }
@@ -969,7 +1069,7 @@ function readRoomRoute(): AppRoute {
   if (!match) {
     return {
       roomId: defaultLobby ? null : queryRoom,
-      view: queryView(),
+      view: defaultLobby ? queryDefaultLobbyView() : queryView(),
       embedded,
       defaultLobby
     };
@@ -1013,6 +1113,11 @@ function getQueryRoomId() {
 function queryView(): RoomView {
   const view = new URLSearchParams(window.location.search).get("view");
   return view === "watch" ? "watch" : "play";
+}
+
+function queryDefaultLobbyView(): RoomView {
+  const view = new URLSearchParams(window.location.search).get("view");
+  return view === "play" ? "play" : "watch";
 }
 
 function roomRoutePath(roomId: string, view: RoomView, embedded: boolean) {

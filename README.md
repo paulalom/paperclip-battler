@@ -48,7 +48,7 @@ Paperclip Battler can create short room ids for browser-run multiplayer sessions
 
 Use the room controls in the app header to create a room, copy a play link like `/rooms/abc123`, copy a watch link like `/watch/abc123`, export the room JSON, or import a room JSON file. Watch links open the same two-pane game layout with read-only spectator frames.
 
-For embedded hosts, create rooms through the bridge API and link users to `/embed/abc123` for play or `/embed/watch/abc123` for spectator mode. `/embed?lobby=default` resolves to the current default lobby, creating or rotating it through the bridge when needed. Existing `/rooms/abc123?embed=1` and `/watch/abc123?embed=1` links also enable embedded mode. Embedded play mode assigns one active browser session to each player slot; once both slots are occupied, later sessions load as observers. Embedded mode keeps the player panes visible but hides the app header, room creation/copy/export/import controls, bridge URL, and Paperclip Battler branding. Hosts can pass `?bridgeUrl=http%3A%2F%2F127.0.0.1%3A8787` when they need the embedded page to use a specific bridge.
+For embedded hosts, create rooms through the bridge API and link users to `/embed/abc123` for play or `/embed/watch/abc123` for spectator mode. `/embed?lobby=default` resolves to the current default lobby, creating it through the bridge when needed. The default lobby is an attract-mode heuristic-vs-heuristic match and defaults to watch-only; pass `view=play` only when a host intentionally wants player-slot assignment. Existing `/rooms/abc123?embed=1` and `/watch/abc123?embed=1` links also enable embedded mode. Embedded play mode assigns one active browser session to each player slot; once both slots are occupied, later sessions load as observers. Embedded mode keeps the player panes visible but hides the app header, room creation/copy/export/import controls, bridge URL, and Paperclip Battler branding. Hosts can pass `?bridgeUrl=http%3A%2F%2F127.0.0.1%3A8787` when they need the embedded page to use a specific bridge.
 
 Room-aware bridge endpoints:
 
@@ -70,6 +70,8 @@ Room-aware bridge endpoints:
 - `POST /rooms/:id/save/import` with `{ "player": "left", "save": { "localStorage": {}, "sessionStorage": {} } }`
 
 Existing bridge endpoints also accept `room` in the query string or JSON body, for example `GET /health?room=abc123` and `POST /players/ready` with `{ "room": "abc123", "player": "right", "ready": true, "force": true }`. Player frames load through room-scoped URLs such as `/rooms/abc123/players/left/index2.html`, so browser storage is partitioned by room and player.
+
+The bridge launches a local headless Chrome, Edge, or Chromium process to own the default attract lobby. Set `PAPERCLIP_DEFAULT_ATTRACT=0` to disable it, `PAPERCLIP_ATTRACT_BROWSER_PATH` to point at a browser executable, or `PAPERCLIP_DEFAULT_ATTRACT_RESTART_DELAY_MS` to change the winner overlay delay before default viewers follow the next lobby.
 
 Available MCP tools:
 
