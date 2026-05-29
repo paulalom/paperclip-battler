@@ -43,7 +43,9 @@ The `Ready` button is a shared start gate. User game input and MCP action comman
 
 Paperclip Battler can create short room ids for browser-run multiplayer sessions. The actual Universal Paperclips game still runs inside each player browser; the bridge only owns small room metadata, player slot status, latest snapshots, tiny JSON state, and MCP routing.
 
-Use the room controls in the app header to create a room, copy a play link like `/rooms/abc123`, copy a watch link like `/watch/abc123`, export the room JSON, or import a room JSON file.
+Use the room controls in the app header to create a room, copy a play link like `/rooms/abc123`, copy a watch link like `/watch/abc123`, export the room JSON, or import a room JSON file. Watch links open the same two-pane game layout with read-only spectator frames.
+
+For embedded hosts, create rooms through the bridge API and link users to `/embed/abc123` for play or `/embed/watch/abc123` for spectator mode. Existing `/rooms/abc123?embed=1` and `/watch/abc123?embed=1` links also enable embedded mode. Embedded mode keeps the player panes visible but hides the app header, room creation/copy/export/import controls, bridge URL, and Paperclip Battler branding. Hosts can pass `?bridgeUrl=http%3A%2F%2F127.0.0.1%3A8787` when they need the embedded page to use a specific bridge.
 
 Room-aware bridge endpoints:
 

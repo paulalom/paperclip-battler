@@ -17,6 +17,8 @@ const DEFAULT_ROOM_ID = "local";
 const ROOM_ID_LENGTH = 6;
 const ROOM_EVENT_HISTORY_LIMIT = 80;
 const MAX_JSON_BODY_SIZE = 5_000_000;
+const PAPERCLIP_CLICK_RATE_LIMIT_LABEL = "10 clicks per second per session";
+const RATE_LIMIT_CLEANUP_INTERVAL_MS = 60_000;
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const PAULS_INSTRUCTION_PATHS = [
   process.env.PAULS_AGENT_AI_INSTRUCTIONS_PATH,
@@ -39,6 +41,41 @@ type InstructionMode = (typeof INSTRUCTION_MODES)[number];
 type PlayerId = (typeof PLAYER_IDS)[number];
 type PlayerRef = (typeof PLAYER_REF_VALUES)[number];
 type PlayerMode = (typeof PLAYER_MODES)[number];
+type PlayerAssetMode = "player" | "spectator";
+type StoragePartitionMode = "player" | "spectator";
+
+type RateLimitPolicy = {
+  name: string;
+  windowMs: number;
+  max: number;
+  message: string;
+};
+
+type RateLimitBucket = {
+  count: number;
+  resetAt: number;
+};
+
+type RateLimitTarget = {
+  policy: RateLimitPolicy;
+  keyParts: Array<string | number | undefined>;
+};
+
+type RateLimitResult = {
+  allowed: boolean;
+  retryAfterMs: number;
+  message: string;
+};
+
+class RateLimitError extends Error {
+  retryAfterMs: number;
+
+  constructor(result: RateLimitResult) {
+    super(result.message);
+    this.name = "RateLimitError";
+    this.retryAfterMs = result.retryAfterMs;
+  }
+}
 
 const PLAYER_LABELS: Record<PlayerId, string> = {
   left: "Player 1",
@@ -49,6 +86,63 @@ const DEFAULT_PLAYER_MODES: Record<PlayerId, PlayerMode> = {
   left: "human",
   right: "agent"
 };
+
+const RATE_LIMITS = {
+  paperclipClick: {
+    name: "paperclip-click",
+    windowMs: 1_000,
+    max: 10,
+    message: `Paperclipper rate limit exceeded: ${PAPERCLIP_CLICK_RATE_LIMIT_LABEL}.`
+  },
+  playerControl: {
+    name: "player-control",
+    windowMs: 1_000,
+    max: 30,
+    message: "Too many requests. Please try again shortly."
+  },
+  bridgeRead: {
+    name: "bridge-read",
+    windowMs: 60_000,
+    max: 180,
+    message: "Too many requests. Please try again shortly."
+  },
+  bridgeWrite: {
+    name: "bridge-write",
+    windowMs: 60_000,
+    max: 60,
+    message: "Too many requests. Please try again shortly."
+  },
+  bridgeBulkWrite: {
+    name: "bridge-bulk-write",
+    windowMs: 60_000,
+    max: 12,
+    message: "Too many requests. Please try again shortly."
+  },
+  bridgeCommand: {
+    name: "bridge-command",
+    windowMs: 60_000,
+    max: 30,
+    message: "Too many requests. Please try again shortly."
+  },
+  assetProxy: {
+    name: "asset-proxy",
+    windowMs: 60_000,
+    max: 240,
+    message: "Too many requests. Please try again shortly."
+  },
+  eventStream: {
+    name: "event-stream",
+    windowMs: 60_000,
+    max: 30,
+    message: "Too many requests. Please try again shortly."
+  },
+  fallback: {
+    name: "bridge",
+    windowMs: 60_000,
+    max: 240,
+    message: "Too many requests. Please try again shortly."
+  }
+} satisfies Record<string, RateLimitPolicy>;
 
 type AgentButton = {
   id: string;
@@ -170,6 +264,8 @@ type RoomState = {
 const rooms = new Map<string, RoomState>([[DEFAULT_ROOM_ID, createRoomState(DEFAULT_ROOM_ID, "Local Room")]]);
 
 let instructionMode: InstructionMode = "none";
+let lastRateLimitCleanupAt = Date.now();
+const rateLimitBuckets = new Map<string, RateLimitBucket>();
 const commandWaiters = new Map<string, (result: AgentCommandResult) => void>();
 const commandResults = new Map<string, AgentCommandResult>();
 
@@ -548,6 +644,8 @@ function startBridge() {
     const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "127.0.0.1"}`);
 
     try {
+      if (!applyGatewayRateLimit(request, response, url)) return;
+
       if (request.method === "GET" && url.pathname === "/rooms") {
         sendJson(response, 200, { ok: true, rooms: Array.from(rooms.keys()).map((roomId) => serializeRoom(roomId)) });
         return;
@@ -831,6 +929,11 @@ function startBridge() {
 
       sendJson(response, 404, { ok: false, message: "Not found." });
     } catch (error) {
+      if (error instanceof RateLimitError) {
+        sendRateLimitError(response, error);
+        return;
+      }
+
       sendJson(response, 500, {
         ok: false,
         message: error instanceof Error ? error.message : "Bridge error."
@@ -923,6 +1026,11 @@ async function handleRoomPath(
     return true;
   }
 
+  if (request.method === "GET" && roomPath.kind === "watch" && roomPath.rest.startsWith("/players/")) {
+    await proxyPlayerAsset(url, response, undefined, roomId, "spectator");
+    return true;
+  }
+
   if (request.method === "GET" && roomPath.kind === "rooms" && roomPath.rest.startsWith("/agent/")) {
     await proxyPlayerAsset(url, response, "right", roomId);
     return true;
@@ -931,7 +1039,13 @@ async function handleRoomPath(
   return false;
 }
 
-async function proxyPlayerAsset(url: URL, response: ServerResponse, fallbackPlayer?: PlayerId, fallbackRoomId = DEFAULT_ROOM_ID) {
+async function proxyPlayerAsset(
+  url: URL,
+  response: ServerResponse,
+  fallbackPlayer?: PlayerId,
+  fallbackRoomId = DEFAULT_ROOM_ID,
+  assetMode: PlayerAssetMode = "player"
+) {
   const roomPath = parseRoomPath(url.pathname);
   const assetPath = roomPath?.rest ?? url.pathname;
   const roomId = roomPath ? roomPath.roomId : fallbackRoomId;
@@ -960,7 +1074,7 @@ async function proxyPlayerAsset(url: URL, response: ServerResponse, fallbackPlay
       "Content-Type": contentType,
       "Cache-Control": "no-store"
     });
-    response.end(injectPlayerController(html, roomId, playerId));
+    response.end(injectPlayerController(html, roomId, playerId, assetMode));
     return;
   }
 
@@ -972,11 +1086,17 @@ async function proxyPlayerAsset(url: URL, response: ServerResponse, fallbackPlay
   response.end(body);
 }
 
-function injectPlayerController(html: string, roomId: string, playerId: PlayerId) {
-  const storageScript = `<script>${createStoragePartitionScript(roomId, playerId)}</script>`;
-  const controllerScript = `<script>${createPlayerControllerScript(roomId, playerId)}</script>`;
-  const withStorage = html.replace(/<head([^>]*)>/i, (match) => `${match}${storageScript}`);
-  const htmlWithStorage = withStorage === html ? `${storageScript}${html}` : withStorage;
+function injectPlayerController(html: string, roomId: string, playerId: PlayerId, assetMode: PlayerAssetMode = "player") {
+  const storageScript = `<script>${createStoragePartitionScript(roomId, playerId, assetMode)}</script>`;
+  const controllerScript =
+    assetMode === "spectator"
+      ? `<script>${createSpectatorControllerScript(roomId, playerId)}</script>`
+      : `<script>${createPlayerControllerScript(roomId, playerId)}</script>`;
+  const headScripts = assetMode === "spectator" ? `${storageScript}${controllerScript}` : storageScript;
+  const withStorage = html.replace(/<head([^>]*)>/i, (match) => `${match}${headScripts}`);
+  const htmlWithStorage = withStorage === html ? `${headScripts}${html}` : withStorage;
+
+  if (assetMode === "spectator") return htmlWithStorage;
 
   if (/<\/body>/i.test(htmlWithStorage)) {
     return htmlWithStorage.replace(/<\/body>/i, () => `${controllerScript}</body>`);
@@ -985,12 +1105,13 @@ function injectPlayerController(html: string, roomId: string, playerId: PlayerId
   return `${htmlWithStorage}${controllerScript}`;
 }
 
-function createStoragePartitionScript(roomId: string, playerId: PlayerId) {
+function createStoragePartitionScript(roomId: string, playerId: PlayerId, partitionMode: StoragePartitionMode = "player") {
   return String.raw`
 (() => {
   const ROOM_ID = ${JSON.stringify(roomId)};
   const PLAYER_ID = ${JSON.stringify(playerId)};
-  const PREFIX = "paperclip-battler:" + (ROOM_ID === "local" ? "" : ROOM_ID + ":") + PLAYER_ID + ":";
+  const PARTITION_MODE = ${JSON.stringify(partitionMode)};
+  const PREFIX = "paperclip-battler:" + (ROOM_ID === "local" ? "" : ROOM_ID + ":") + PLAYER_ID + (PARTITION_MODE === "spectator" ? ":watch:" : ":");
 
   const partition = (storage) => {
     const partitionKeys = () => {
@@ -1044,6 +1165,157 @@ function createPlayerControllerScript(roomId: string, playerId: PlayerId) {
   return AGENT_CONTROLLER_SCRIPT
     .replace("__PAPERCLIP_ROOM_ID__", JSON.stringify(roomId))
     .replace("__PAPERCLIP_PLAYER_ID__", JSON.stringify(playerId));
+}
+
+function createSpectatorControllerScript(roomId: string, playerId: PlayerId) {
+  const initialSave = getPlayerState(roomId, playerId).latestReport?.save ?? null;
+  return String.raw`
+(() => {
+  const ROOM_ID = ${JSON.stringify(roomId)};
+  const PLAYER_ID = ${JSON.stringify(playerId)};
+  const INITIAL_SAVE = ${inlineJson(initialSave)};
+  const SAVE_URL = "/rooms/" + encodeURIComponent(ROOM_ID) + "/save";
+  const BLOCK_EVENTS = [
+    "pointerdown",
+    "pointerup",
+    "mousedown",
+    "mouseup",
+    "click",
+    "dblclick",
+    "auxclick",
+    "contextmenu",
+    "touchstart",
+    "touchend",
+    "input",
+    "change",
+    "keydown"
+  ];
+
+  let lastSaveSignature = "";
+
+  const normalizeRecord = (value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, String(item)]));
+  };
+
+  const normalizeSave = (value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    return {
+      localStorage: normalizeRecord(value.localStorage),
+      sessionStorage: normalizeRecord(value.sessionStorage)
+    };
+  };
+
+  const saveSignature = (save) => JSON.stringify(save);
+
+  const importStorage = (storage, values) => {
+    storage.clear();
+    for (const [key, value] of Object.entries(values || {})) {
+      storage.setItem(key, String(value));
+    }
+  };
+
+  const applySave = (value) => {
+    const save = normalizeSave(value);
+    if (!save) return false;
+    importStorage(window.localStorage, save.localStorage);
+    importStorage(window.sessionStorage, save.sessionStorage);
+    lastSaveSignature = saveSignature(save);
+    return true;
+  };
+
+  const blockTrustedInput = (event) => {
+    if (!event.isTrusted) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  };
+
+  const installStyles = () => {
+    if (document.getElementById("paperclip-battler-spectator-style")) return;
+    const style = document.createElement("style");
+    style.id = "paperclip-battler-spectator-style";
+    style.textContent = [
+      'html[data-paperclip-battler-spectator="true"],',
+      'html[data-paperclip-battler-spectator="true"] body {',
+      "cursor: not-allowed !important;",
+      "}",
+      "#paperclip-battler-spectator-shield {",
+      "position: fixed !important;",
+      "inset: 0 !important;",
+      "z-index: 2147483647 !important;",
+      "cursor: not-allowed !important;",
+      "background: rgba(255, 255, 255, 0) !important;",
+      "touch-action: none !important;",
+      "}",
+      'html[data-paperclip-battler-spectator="true"] button:not(:disabled),',
+      'html[data-paperclip-battler-spectator="true"] input:not([type="hidden"]):not(:disabled),',
+      'html[data-paperclip-battler-spectator="true"] select:not(:disabled),',
+      'html[data-paperclip-battler-spectator="true"] textarea:not(:disabled),',
+      'html[data-paperclip-battler-spectator="true"] a[onclick],',
+      'html[data-paperclip-battler-spectator="true"] [role="button"] {',
+      "cursor: not-allowed !important;",
+      "pointer-events: none !important;",
+      "}"
+    ].join("");
+    document.head.appendChild(style);
+  };
+
+  const ensureShield = () => {
+    if (!document.body || document.getElementById("paperclip-battler-spectator-shield")) return;
+    const shield = document.createElement("div");
+    shield.id = "paperclip-battler-spectator-shield";
+    shield.setAttribute("aria-hidden", "true");
+    for (const eventName of BLOCK_EVENTS) {
+      shield.addEventListener(eventName, blockTrustedInput, true);
+    }
+    document.body.appendChild(shield);
+  };
+
+  const installInputGuards = () => {
+    document.documentElement.dataset.paperclipBattlerSpectator = "true";
+    installStyles();
+    ensureShield();
+    for (const eventName of BLOCK_EVENTS) {
+      window.addEventListener(eventName, blockTrustedInput, true);
+    }
+  };
+
+  const syncSave = async () => {
+    try {
+      const response = await fetch(SAVE_URL, { cache: "no-store" });
+      if (!response.ok) return;
+      const payload = await response.json();
+      const save = normalizeSave(payload?.saves?.[PLAYER_ID]);
+      if (!save) return;
+      const signature = saveSignature(save);
+      if (signature === lastSaveSignature) return;
+      applySave(save);
+      window.location.reload();
+    } catch {
+      // The bridge may be restarting.
+    }
+  };
+
+  applySave(INITIAL_SAVE);
+
+  const start = () => {
+    installInputGuards();
+    syncSave();
+    window.setInterval(syncSave, 2_000);
+  };
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", start, { once: true });
+  } else {
+    start();
+  }
+})();
+`;
+}
+
+function inlineJson(value: unknown) {
+  const json = JSON.stringify(value) ?? "null";
+  return json.replace(/</g, "\\u003c").replace(/\u2028/g, "\\u2028").replace(/\u2029/g, "\\u2029");
 }
 
 function createPlayerStates() {
@@ -1509,6 +1781,7 @@ function queueCommand(roomId: string, playerId: PlayerId, command: AgentCommand)
     throw new Error(`Another ${PLAYER_LABELS[playerId]} command is already pending.`);
   }
 
+  assertCommandRateLimit(roomId, playerId, command.type);
   state.pendingCommand = command;
 
   return new Promise((resolve, reject) => {
@@ -1563,14 +1836,221 @@ function textJson(value: unknown) {
   };
 }
 
+function applyGatewayRateLimit(request: IncomingMessage, response: ServerResponse, url: URL) {
+  const target = getGatewayRateLimitTarget(request, url);
+  if (!target) return true;
+
+  const result = consumeRateLimit(target.policy, target.keyParts);
+  if (result.allowed) return true;
+
+  sendRateLimit(response, result);
+  return false;
+}
+
+function getGatewayRateLimitTarget(request: IncomingMessage, url: URL): RateLimitTarget | null {
+  const method = request.method ?? "GET";
+  if (method === "OPTIONS") return null;
+
+  const roomPath = safeParseRoomPath(url.pathname);
+  const roomId = roomPath?.roomId ?? safeResolveUrlRoomId(url);
+  const playerId = safeResolvePlayerId(url, roomPath);
+  const clientKey = getClientKey(request);
+  const routeKey = getGatewayRouteKey(url, roomPath);
+
+  if (method === "POST" && url.pathname === "/command/click") {
+    return null;
+  }
+
+  if (isPlayerControlPath(url.pathname)) {
+    return {
+      policy: RATE_LIMITS.playerControl,
+      keyParts: [roomId, playerId, clientKey, routeKey]
+    };
+  }
+
+  if (isAssetProxyPath(url.pathname, roomPath)) {
+    return {
+      policy: RATE_LIMITS.assetProxy,
+      keyParts: [roomId, playerId, clientKey]
+    };
+  }
+
+  if (roomPath?.kind === "rooms" && roomPath.rest === "/events") {
+    return {
+      policy: method === "GET" ? RATE_LIMITS.eventStream : RATE_LIMITS.bridgeWrite,
+      keyParts: [roomId, clientKey, method]
+    };
+  }
+
+  if (isBulkRoomWrite(method, roomPath)) {
+    return {
+      policy: RATE_LIMITS.bridgeBulkWrite,
+      keyParts: [roomId, clientKey, routeKey]
+    };
+  }
+
+  if (method === "POST") {
+    return {
+      policy: RATE_LIMITS.bridgeWrite,
+      keyParts: [roomId, clientKey, routeKey]
+    };
+  }
+
+  if (method === "GET" || method === "HEAD") {
+    return {
+      policy: RATE_LIMITS.bridgeRead,
+      keyParts: [roomId, clientKey, routeKey]
+    };
+  }
+
+  return {
+    policy: RATE_LIMITS.fallback,
+    keyParts: [clientKey, method, routeKey]
+  };
+}
+
+function assertCommandRateLimit(roomId: string, playerId: PlayerId, commandType: AgentCommand["type"]) {
+  const target =
+    commandType === "click"
+      ? { policy: RATE_LIMITS.paperclipClick, keyParts: [roomId] }
+      : { policy: RATE_LIMITS.bridgeCommand, keyParts: [roomId, playerId, commandType] };
+  const result = consumeRateLimit(target.policy, target.keyParts);
+  if (!result.allowed) throw new RateLimitError(result);
+}
+
+function consumeRateLimit(policy: RateLimitPolicy, keyParts: Array<string | number | undefined>): RateLimitResult {
+  const now = Date.now();
+  cleanupRateLimitBuckets(now);
+
+  const key = [policy.name, ...keyParts.map(formatRateLimitKeyPart)].join(":");
+  const bucket = rateLimitBuckets.get(key);
+
+  if (!bucket || bucket.resetAt <= now) {
+    rateLimitBuckets.set(key, { count: 1, resetAt: now + policy.windowMs });
+    return { allowed: true, retryAfterMs: 0, message: policy.message };
+  }
+
+  if (bucket.count >= policy.max) {
+    return {
+      allowed: false,
+      retryAfterMs: Math.max(1, bucket.resetAt - now),
+      message: policy.message
+    };
+  }
+
+  bucket.count += 1;
+  return { allowed: true, retryAfterMs: bucket.resetAt - now, message: policy.message };
+}
+
+function cleanupRateLimitBuckets(now: number) {
+  if (now - lastRateLimitCleanupAt < RATE_LIMIT_CLEANUP_INTERVAL_MS) return;
+  lastRateLimitCleanupAt = now;
+
+  for (const [key, bucket] of rateLimitBuckets) {
+    if (bucket.resetAt <= now) rateLimitBuckets.delete(key);
+  }
+}
+
+function formatRateLimitKeyPart(value: string | number | undefined) {
+  return encodeURIComponent(String(value ?? "default"));
+}
+
+function sendRateLimitError(response: ServerResponse, error: RateLimitError) {
+  sendRateLimit(response, {
+    allowed: false,
+    retryAfterMs: error.retryAfterMs,
+    message: error.message
+  });
+}
+
+function sendRateLimit(response: ServerResponse, result: RateLimitResult) {
+  sendJson(
+    response,
+    429,
+    {
+      ok: false,
+      message: result.message
+    },
+    {
+      "Retry-After": String(Math.max(1, Math.ceil(result.retryAfterMs / 1000)))
+    }
+  );
+}
+
+function getClientKey(request: IncomingMessage) {
+  const forwardedFor = request.headers["x-forwarded-for"];
+  const forwardedValue = Array.isArray(forwardedFor) ? forwardedFor[0] : forwardedFor;
+  const forwardedClient = forwardedValue?.split(",")[0]?.trim();
+  return forwardedClient || request.socket.remoteAddress || "local";
+}
+
+function getGatewayRouteKey(url: URL, roomPath: ReturnType<typeof parseRoomPath> | null) {
+  if (!roomPath) return url.pathname;
+  return `/${roomPath.kind}/:room${roomPath.rest.replace(/^\/players\/[^/]+/, "/players/:player")}`;
+}
+
+function safeParseRoomPath(pathname: string) {
+  try {
+    return parseRoomPath(pathname);
+  } catch {
+    return null;
+  }
+}
+
+function safeResolveUrlRoomId(url: URL) {
+  try {
+    return resolveUrlRoomId(url);
+  } catch {
+    return DEFAULT_ROOM_ID;
+  }
+}
+
+function safeResolvePlayerId(url: URL, roomPath: ReturnType<typeof parseRoomPath> | null) {
+  const path = roomPath?.rest ?? url.pathname;
+  const pathMatch = path.match(/^\/players\/([^/]+)/);
+  const rawPlayer = url.searchParams.get("player") ?? pathMatch?.[1] ?? (path.startsWith("/agent/") ? "right" : undefined);
+
+  try {
+    return normalizePlayerId(rawPlayer);
+  } catch {
+    return "right";
+  }
+}
+
+function isPlayerControlPath(pathname: string) {
+  return (
+    pathname === "/player-control/config" ||
+    pathname === "/agent-control/config" ||
+    pathname === "/player-control/report" ||
+    pathname === "/agent-control/report" ||
+    pathname === "/player-control/next-command" ||
+    pathname === "/agent-control/next-command" ||
+    pathname === "/player-control/result" ||
+    pathname === "/agent-control/result"
+  );
+}
+
+function isAssetProxyPath(pathname: string, roomPath: ReturnType<typeof parseRoomPath> | null) {
+  const path = roomPath?.rest ?? pathname;
+  return path.startsWith("/players/") || path.startsWith("/agent/");
+}
+
+function isBulkRoomWrite(method: string, roomPath: ReturnType<typeof parseRoomPath> | null) {
+  return (
+    method === "POST" &&
+    roomPath?.kind === "rooms" &&
+    (roomPath.rest === "/import" || roomPath.rest === "/save/import")
+  );
+}
+
 function setCors(response: ServerResponse) {
   response.setHeader("Access-Control-Allow-Origin", "*");
   response.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   response.setHeader("Access-Control-Allow-Headers", "content-type");
 }
 
-function sendJson(response: ServerResponse, status: number, value: unknown) {
-  response.writeHead(status, { "Content-Type": "application/json" });
+function sendJson(response: ServerResponse, status: number, value: unknown, headers: Record<string, string> = {}) {
+  response.writeHead(status, { "Content-Type": "application/json", ...headers });
   response.end(JSON.stringify(value));
 }
 
@@ -1802,6 +2282,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   let playerReady = false;
   let allPlayersReady = false;
   let inputShield = null;
+  let inputTooltip = null;
 
   const cssEscape = (value) => {
     if (window.CSS && typeof window.CSS.escape === "function") return window.CSS.escape(value);
@@ -1811,6 +2292,8 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   const normalizeText = (value) => String(value || "").replace(/\s+/g, " ").trim();
   const agentCanAct = () => playerMode === "agent" || playerMode === "both";
   const userInputLocked = () => !allPlayersReady || playerMode === "agent";
+  const inputLockMessage = () =>
+    !allPlayersReady ? "Both players must be ready first." : "Mouse input is locked while this player is Agent-only.";
 
   const installStyles = () => {
     const style = document.createElement("style");
@@ -1828,6 +2311,29 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
       "background: rgba(255, 255, 255, 0) !important;",
       "pointer-events: none !important;",
       "touch-action: none !important;",
+      "}",
+      "#paperclip-battler-input-tooltip {",
+      "all: initial !important;",
+      "display: block !important;",
+      "box-sizing: border-box !important;",
+      "position: fixed !important;",
+      "left: 16px !important;",
+      "top: 16px !important;",
+      "z-index: 2147483647 !important;",
+      "max-width: min(280px, calc(100vw - 32px)) !important;",
+      "padding: 7px 9px !important;",
+      "border-radius: 6px !important;",
+      "background: rgba(17, 24, 39, 0.94) !important;",
+      "color: #ffffff !important;",
+      "font: 12px/1.35 system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif !important;",
+      "box-shadow: 0 8px 22px rgba(0, 0, 0, 0.22) !important;",
+      "opacity: 0 !important;",
+      "pointer-events: none !important;",
+      "white-space: normal !important;",
+      "transition: opacity 120ms ease !important;",
+      "}",
+      '#paperclip-battler-input-tooltip[data-visible="true"] {',
+      "opacity: 1 !important;",
       "}",
       'html[data-paperclip-battler-input-locked="true"] #paperclip-battler-input-shield {',
       "display: block !important;",
@@ -1869,11 +2375,64 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     inputShield = document.createElement("div");
     inputShield.id = "paperclip-battler-input-shield";
     inputShield.setAttribute("aria-hidden", "true");
+    inputShield.title = inputLockMessage();
     for (const eventName of SHIELD_EVENTS) {
       inputShield.addEventListener(eventName, blockShieldInput, true);
     }
+    inputShield.addEventListener("pointerenter", showInputTooltip, true);
+    inputShield.addEventListener("pointermove", showInputTooltip, true);
+    inputShield.addEventListener("pointerleave", hideInputTooltip, true);
     document.body.appendChild(inputShield);
+    ensureInputTooltip();
     return inputShield;
+  };
+
+  const ensureInputTooltip = () => {
+    if (inputTooltip?.isConnected) return inputTooltip;
+    const shield = inputShield?.isConnected ? inputShield : null;
+    if (!shield) return null;
+    inputTooltip = document.createElement("div");
+    inputTooltip.id = "paperclip-battler-input-tooltip";
+    inputTooltip.setAttribute("role", "status");
+    inputTooltip.textContent = inputLockMessage();
+    shield.appendChild(inputTooltip);
+    return inputTooltip;
+  };
+
+  const positionInputTooltip = (event) => {
+    const tooltip = ensureInputTooltip();
+    if (!tooltip || typeof event?.clientX !== "number" || typeof event?.clientY !== "number") return;
+    const margin = 12;
+    const offset = 14;
+    tooltip.style.maxWidth = Math.max(160, Math.min(280, window.innerWidth - margin * 2)) + "px";
+    tooltip.textContent = inputLockMessage();
+
+    let left = event.clientX + offset;
+    let top = event.clientY + offset;
+    const rect = tooltip.getBoundingClientRect();
+
+    if (left + rect.width > window.innerWidth - margin) {
+      left = Math.max(margin, event.clientX - rect.width - offset);
+    }
+    if (top + rect.height > window.innerHeight - margin) {
+      top = Math.max(margin, event.clientY - rect.height - offset);
+    }
+
+    tooltip.style.left = left + "px";
+    tooltip.style.top = top + "px";
+  };
+
+  const showInputTooltip = (event) => {
+    if (!userInputLocked()) return hideInputTooltip();
+    const tooltip = ensureInputTooltip();
+    if (!tooltip) return;
+    tooltip.textContent = inputLockMessage();
+    tooltip.dataset.visible = "true";
+    positionInputTooltip(event);
+  };
+
+  const hideInputTooltip = () => {
+    if (inputTooltip) delete inputTooltip.dataset.visible;
   };
 
   const elementSelector = (element, fallbackIndex) => {
@@ -1945,7 +2504,14 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   const applyInputLock = () => {
     const locked = userInputLocked();
     document.documentElement.dataset.paperclipBattlerInputLocked = String(locked);
-    if (document.body) ensureInputShield();
+    if (document.body) {
+      const shield = ensureInputShield();
+      const message = inputLockMessage();
+      shield.title = message;
+      const tooltip = ensureInputTooltip();
+      if (tooltip) tooltip.textContent = message;
+      if (!locked) hideInputTooltip();
+    }
     for (const element of [...buttonElements(), ...controlElements()]) {
       if (locked) {
         element.setAttribute("data-paperclip-battler-user-locked", "true");

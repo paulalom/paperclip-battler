@@ -131,12 +131,18 @@ type BridgeHealth = {
 
 type BridgeStatus = "checking" | "connected" | "offline";
 type RoomView = "play" | "watch";
+type AppRoute = {
+  roomId: string | null;
+  view: RoomView;
+  embedded: boolean;
+};
 
 export function App() {
   const initialRoute = readRoomRoute();
-  const [bridgeUrl, setBridgeUrl] = useState(() => localStorage.getItem(BRIDGE_URL_KEY) ?? "http://127.0.0.1:8787");
+  const [bridgeUrl, setBridgeUrl] = useState(() => readInitialBridgeUrl());
   const [roomId, setRoomId] = useState(() => initialRoute.roomId ?? localStorage.getItem(ROOM_ID_KEY) ?? DEFAULT_ROOM_ID);
   const [roomView, setRoomView] = useState<RoomView>(() => initialRoute.view);
+  const [embedded, setEmbedded] = useState(() => initialRoute.embedded);
   const [roomNotice, setRoomNotice] = useState("");
   const [playerModes, setPlayerModes] = useState<Record<PlayerId, PlayerMode>>(readPlayerModes);
   const [health, setHealth] = useState<BridgeHealth | null>(null);
@@ -166,6 +172,7 @@ export function App() {
       const nextRoute = readRoomRoute();
       setRoomId(nextRoute.roomId ?? localStorage.getItem(ROOM_ID_KEY) ?? DEFAULT_ROOM_ID);
       setRoomView(nextRoute.view);
+      setEmbedded(nextRoute.embedded);
     };
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
@@ -253,6 +260,10 @@ export function App() {
 
   function playerUrl(playerId: PlayerId) {
     return `${trimmedBridgeUrl}/rooms/${encodeURIComponent(roomId)}/players/${playerId}/index2.html`;
+  }
+
+  function spectatorUrl(playerId: PlayerId) {
+    return `${trimmedBridgeUrl}/watch/${encodeURIComponent(roomId)}/players/${playerId}/index2.html`;
   }
 
   function reloadPlayer(playerId: PlayerId) {
@@ -357,7 +368,7 @@ export function App() {
     const normalized = normalizeRoomId(nextRoomId);
     setRoomId(normalized);
     setRoomView(nextView);
-    const nextPath = `${nextView === "watch" ? "/watch" : "/rooms"}/${encodeURIComponent(normalized)}`;
+    const nextPath = roomRoutePath(normalized, nextView, embedded);
     window.history.pushState({}, "", nextPath);
   }
 
@@ -427,72 +438,74 @@ export function App() {
   }
 
   return (
-    <main className="app-shell">
-      <header className="topbar">
-        <div className="brand">
-          <div className="brand-mark" aria-hidden="true">
-            <SplitSquareVertical size={24} />
+    <main className={`app-shell ${embedded ? "embedded" : ""}`}>
+      {!embedded ? (
+        <header className="topbar">
+          <div className="brand">
+            <div className="brand-mark" aria-hidden="true">
+              <SplitSquareVertical size={24} />
+            </div>
+            <div>
+              <h1>Paperclip Battler</h1>
+              <a href={ORIGINAL_URL} target="_blank" rel="noreferrer">
+                Universal Paperclips <ExternalLink size={13} />
+              </a>
+            </div>
           </div>
-          <div>
-            <h1>Paperclip Battler</h1>
-            <a href={ORIGINAL_URL} target="_blank" rel="noreferrer">
-              Universal Paperclips <ExternalLink size={13} />
-            </a>
-          </div>
-        </div>
 
-        <div className="topbar-tools">
-          <div className="room-bar">
-            <button className="icon-button" onClick={createRoom} title="Create room">
-              <Plus size={16} />
-            </button>
-            <button
-              className={`room-chip ${roomView === "play" ? "active" : ""}`}
-              onClick={() => navigateRoom(roomId, "play")}
-              title={playUrl}
-            >
-              <Link size={14} />
-              <span>{roomId}</span>
-            </button>
-            <button
-              className={`icon-button ${roomView === "watch" ? "active" : ""}`}
-              onClick={() => navigateRoom(roomId, "watch")}
-              title={watchUrl}
-            >
-              <Eye size={16} />
-            </button>
-            <button className="icon-button" onClick={() => copyRoomUrl("play")} title="Copy play link">
-              <Copy size={16} />
-            </button>
-            <button className="icon-button" onClick={() => copyRoomUrl("watch")} title="Copy watch link">
-              <Eye size={16} />
-            </button>
-            <button className="icon-button" onClick={exportRoom} title="Export room">
-              <Download size={16} />
-            </button>
-            <button className="icon-button" onClick={() => importInputRef.current?.click()} title="Import room">
-              <Upload size={16} />
-            </button>
-            <input ref={importInputRef} className="hidden-file" type="file" accept="application/json,.json" onChange={importRoom} />
-            {roomNotice ? <span className="room-notice">{roomNotice}</span> : null}
+          <div className="topbar-tools">
+            <div className="room-bar">
+              <button className="icon-button" onClick={createRoom} title="Create room">
+                <Plus size={16} />
+              </button>
+              <button
+                className={`room-chip ${roomView === "play" ? "active" : ""}`}
+                onClick={() => navigateRoom(roomId, "play")}
+                title={playUrl}
+              >
+                <Link size={14} />
+                <span>{roomId}</span>
+              </button>
+              <button
+                className={`icon-button ${roomView === "watch" ? "active" : ""}`}
+                onClick={() => navigateRoom(roomId, "watch")}
+                title={watchUrl}
+              >
+                <Eye size={16} />
+              </button>
+              <button className="icon-button" onClick={() => copyRoomUrl("play")} title="Copy play link">
+                <Copy size={16} />
+              </button>
+              <button className="icon-button" onClick={() => copyRoomUrl("watch")} title="Copy watch link">
+                <Eye size={16} />
+              </button>
+              <button className="icon-button" onClick={exportRoom} title="Export room">
+                <Download size={16} />
+              </button>
+              <button className="icon-button" onClick={() => importInputRef.current?.click()} title="Import room">
+                <Upload size={16} />
+              </button>
+              <input ref={importInputRef} className="hidden-file" type="file" accept="application/json,.json" onChange={importRoom} />
+              {roomNotice ? <span className="room-notice">{roomNotice}</span> : null}
+            </div>
+            <div className="bridge-bar">
+              <span className={`status-pill ${status}`}>{bridgeLabel(status, health)}</span>
+              <input
+                aria-label="MCP bridge URL"
+                value={bridgeUrl}
+                onChange={(event) => setBridgeUrl(event.target.value)}
+                spellCheck={false}
+              />
+              <button className="icon-button" onClick={() => setBridgeUrl("http://127.0.0.1:8787")} title="Reset bridge URL">
+                <RefreshCcw size={16} />
+              </button>
+            </div>
           </div>
-          <div className="bridge-bar">
-            <span className={`status-pill ${status}`}>{bridgeLabel(status, health)}</span>
-            <input
-              aria-label="MCP bridge URL"
-              value={bridgeUrl}
-              onChange={(event) => setBridgeUrl(event.target.value)}
-              spellCheck={false}
-            />
-            <button className="icon-button" onClick={() => setBridgeUrl("http://127.0.0.1:8787")} title="Reset bridge URL">
-              <RefreshCcw size={16} />
-            </button>
-          </div>
-        </div>
-      </header>
+        </header>
+      ) : null}
 
       {roomView === "watch" ? (
-        <WatchView health={health} status={status} />
+        <WatchView health={health} status={status} playerModes={playerModes} sourceForPlayer={spectatorUrl} />
       ) : (
         <section className="split-view">
           {PLAYER_IDS.map((playerId) => (
@@ -518,32 +531,37 @@ export function App() {
   );
 }
 
-function WatchView({ health, status }: { health: BridgeHealth | null; status: BridgeStatus }) {
-  const room = health?.room;
+function WatchView({
+  health,
+  status,
+  playerModes,
+  sourceForPlayer
+}: {
+  health: BridgeHealth | null;
+  status: BridgeStatus;
+  playerModes: Record<PlayerId, PlayerMode>;
+  sourceForPlayer: (playerId: PlayerId) => string;
+}) {
+  const noop = () => undefined;
   return (
-    <section className="watch-view">
-      <div className="watch-header">
-        <div>
-          <h2>{room?.title ?? "Room"}</h2>
-          <span>{room?.id ?? "local"}</span>
-        </div>
-        <div className="watch-stats">
-          <span className={`status-pill ${status}`}>{bridgeLabel(status, health)}</span>
-          <span className="agent-badge">
-            <Eye size={14} />
-            {room?.spectatorCount ?? 0} watching
-          </span>
-          <span className="agent-badge">
-            <Server size={14} />
-            {room?.eventCount ?? 0} events
-          </span>
-        </div>
-      </div>
-      <div className="watch-grid">
-        {PLAYER_IDS.map((playerId) => (
-          <SnapshotPane key={playerId} title={PLAYER_LABELS[playerId]} health={health?.players?.[playerId]} />
-        ))}
-      </div>
+    <section className="split-view watch-split-view">
+      {PLAYER_IDS.map((playerId) => (
+        <OriginalPane
+          key={playerId}
+          title={PLAYER_LABELS[playerId]}
+          source={sourceForPlayer(playerId)}
+          mode={health?.players?.[playerId]?.mode ?? playerModes[playerId]}
+          health={health?.players?.[playerId]}
+          disabled={status === "offline"}
+          allPlayersReady={Boolean(health?.allPlayersReady)}
+          readOnly
+          onModeChange={noop}
+          onReadyChange={noop}
+          onReload={noop}
+          onReset={noop}
+          onReleaseClaim={noop}
+        />
+      ))}
     </section>
   );
 }
@@ -586,13 +604,14 @@ function OriginalPane({
   onReadyChange,
   onReload,
   onReset,
-  onReleaseClaim
+  onReleaseClaim,
+  readOnly = false
 }: {
   title: string;
   source: string;
   mode: PlayerMode;
   health?: BridgePlayerHealth;
-  frameRef: React.RefObject<HTMLIFrameElement>;
+  frameRef?: React.RefObject<HTMLIFrameElement>;
   disabled: boolean;
   allPlayersReady: boolean;
   onModeChange: (mode: PlayerMode) => void;
@@ -600,21 +619,25 @@ function OriginalPane({
   onReload: () => void;
   onReset: () => void;
   onReleaseClaim: () => void;
+  readOnly?: boolean;
 }) {
   const connected = Boolean(health?.connected);
   const buttonCount = health?.buttonCount ?? 0;
   const claim = health?.claim ?? null;
   const ready = Boolean(health?.ready);
   const readyLocked = mode === "agent";
-  const readyDisabled = disabled || readyLocked;
-  const readyTitle = readyLocked
-    ? `${title} is Agent-only. Use set_agent_player_ready from MCP.`
-    : ready
-      ? `${title} is ready`
-      : `Mark ${title} ready`;
+  const controlsDisabled = disabled || readOnly;
+  const readyDisabled = controlsDisabled || readyLocked;
+  const readyTitle = readOnly
+    ? `${title} is read-only in watch view`
+    : readyLocked
+      ? `${title} is Agent-only. Use set_agent_player_ready from MCP.`
+      : ready
+        ? `${title} is ready`
+        : `Mark ${title} ready`;
 
   return (
-    <article className={`pane mode-${mode}`}>
+    <article className={`pane mode-${mode} ${readOnly ? "read-only" : ""}`}>
       <div className="pane-toolbar">
         <div className="pane-title">
           <span>{title}</span>
@@ -624,7 +647,7 @@ function OriginalPane({
             {ready ? "Ready" : "Not ready"}
           </span>
           {!allPlayersReady ? (
-            <span className="agent-badge gate">
+            <span className="agent-badge gate" title="Both players must be ready first.">
               <Lock size={14} />
               Input held
             </span>
@@ -639,6 +662,12 @@ function OriginalPane({
             <span className="agent-badge locked">
               <Lock size={14} />
               Mouse locked
+            </span>
+          ) : null}
+          {readOnly ? (
+            <span className="agent-badge locked">
+              <Eye size={14} />
+              Watch only
             </span>
           ) : null}
           {claim ? (
@@ -661,16 +690,16 @@ function OriginalPane({
             <Check size={15} />
             <span>{ready ? "Ready" : "Ready?"}</span>
           </button>
-          <PlayerModePicker mode={mode} disabled={disabled} onSelect={onModeChange} />
+          <PlayerModePicker mode={mode} disabled={controlsDisabled} onSelect={onModeChange} />
           {claim ? (
-            <button className="icon-button" onClick={onReleaseClaim} title={`Release MCP claim for ${title}`}>
+            <button className="icon-button" disabled={controlsDisabled} onClick={onReleaseClaim} title={`Release MCP claim for ${title}`}>
               <Unlock size={16} />
             </button>
           ) : null}
-          <button className="icon-button" onClick={onReload} title={`Reload ${title}`}>
+          <button className="icon-button" disabled={controlsDisabled} onClick={onReload} title={`Reload ${title}`}>
             <RefreshCcw size={16} />
           </button>
-          <button className="icon-button" onClick={onReset} title={`Reset ${title}`}>
+          <button className="icon-button" disabled={controlsDisabled} onClick={onReset} title={`Reset ${title}`}>
             <RotateCcw size={16} />
           </button>
         </div>
@@ -714,13 +743,61 @@ function bridgeLabel(status: BridgeStatus, health: BridgeHealth | null) {
   return players > 0 ? `MCP ${players}/2 panes` : "MCP waiting";
 }
 
-function readRoomRoute(): { roomId: string | null; view: RoomView } {
+function readRoomRoute(): AppRoute {
+  const embedded = isEmbeddedRoute();
+  const queryRoom = getQueryRoomId();
+  const embedMatch = window.location.pathname.match(/^\/embed(?:\/(rooms|watch))?\/([^/]+)/);
+  if (embedMatch) {
+    return {
+      roomId: normalizeRoomId(decodeURIComponent(embedMatch[2])),
+      view: embedMatch[1] === "watch" ? "watch" : "play",
+      embedded: true
+    };
+  }
+
   const match = window.location.pathname.match(/^\/(rooms|watch)\/([^/]+)/);
-  if (!match) return { roomId: null, view: "play" };
+  if (!match) {
+    return {
+      roomId: queryRoom,
+      view: queryView(),
+      embedded
+    };
+  }
+
   return {
     roomId: normalizeRoomId(decodeURIComponent(match[2])),
-    view: match[1] === "watch" ? "watch" : "play"
+    view: match[1] === "watch" ? "watch" : "play",
+    embedded
   };
+}
+
+function readInitialBridgeUrl() {
+  const params = new URLSearchParams(window.location.search);
+  return params.get("bridgeUrl")?.trim() || params.get("bridge")?.trim() || localStorage.getItem(BRIDGE_URL_KEY) || "http://127.0.0.1:8787";
+}
+
+function isEmbeddedRoute() {
+  const params = new URLSearchParams(window.location.search);
+  const flag = params.get("embed") ?? params.get("embedded");
+  if (window.location.pathname === "/embed" || window.location.pathname.startsWith("/embed/")) return true;
+  if (flag === null) return false;
+  return !["0", "false", "no", "off"].includes(flag.toLowerCase());
+}
+
+function getQueryRoomId() {
+  const room = new URLSearchParams(window.location.search).get("room");
+  return room ? normalizeRoomId(room) : null;
+}
+
+function queryView(): RoomView {
+  const view = new URLSearchParams(window.location.search).get("view");
+  return view === "watch" ? "watch" : "play";
+}
+
+function roomRoutePath(roomId: string, view: RoomView, embedded: boolean) {
+  const encodedRoom = encodeURIComponent(roomId);
+  if (embedded) return view === "watch" ? `/embed/watch/${encodedRoom}` : `/embed/${encodedRoom}`;
+  return `${view === "watch" ? "/watch" : "/rooms"}/${encodedRoom}`;
 }
 
 function normalizeRoomId(value: string) {
