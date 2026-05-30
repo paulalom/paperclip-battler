@@ -47,6 +47,10 @@ button {
   grid-template-rows: auto minmax(0, 1fr);
 }
 
+.room-body > :not(.room-warning-bar) {
+  grid-row: 2;
+}
+
 .topbar {
   min-height: 70px;
   padding: 12px 16px;
