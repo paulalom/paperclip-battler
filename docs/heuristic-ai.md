@@ -54,8 +54,3 @@ Each broad decision tick tries these rules in order and stops after the first su
 - Never click reset, restart, import, export, load, save, investment, deposit, or withdraw controls.
 - Do not let the generic button-priority fallback buy wire; wire buying is controlled only by the wire management rule.
 - Do not let the generic button-priority fallback click `Make Paperclip`; manual paperclip production has its own fast tick.
-
-## Simulation
-
-- Run `npm run heuristic:simulate` to execute deterministic scenario checks plus an abstract full-campaign simulation.
-- The simulation is intentionally cheap: it verifies that the heuristic policy can cross the main progression gates without rendering the browser game loop.

@@ -1,3 +1,4 @@
+// Internal regression harness. Keep this outside mcp/ so release MCP builds do not emit it.
 type Phase = "business" | "earth" | "space" | "complete";
 
 type ProbeStats = {
