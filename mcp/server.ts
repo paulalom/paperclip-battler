@@ -367,6 +367,8 @@ let defaultLobby: { roomId: string; createdAt: number } | null = null;
 let defaultAttractRuntime: DefaultAttractRuntime | null = null;
 let defaultAttractLaunch: Promise<void> | null = null;
 let roomCleanupTimer: ReturnType<typeof setInterval> | null = null;
+let bridgeServer: ReturnType<typeof createServer> | null = null;
+let shutdownStarted = false;
 let lastRateLimitCleanupAt = Date.now();
 const rateLimitBuckets = new Map<string, RateLimitBucket>();
 const commandWaiters = new Map<string, (result: AgentCommandResult) => void>();
@@ -735,13 +737,62 @@ startBridge();
 
 const transport = new StdioServerTransport();
 await mcpServer.connect(transport);
-process.once("SIGINT", shutdownBridgeProcess);
-process.once("SIGTERM", shutdownBridgeProcess);
-
-function shutdownBridgeProcess() {
+process.once("SIGINT", () => void shutdownBridgeProcess(0));
+process.once("SIGTERM", () => void shutdownBridgeProcess(0));
+process.once("SIGHUP", () => void shutdownBridgeProcess(0));
+process.once("disconnect", () => void shutdownBridgeProcess(0));
+process.stdin.once("end", () => void shutdownBridgeProcess(0));
+process.stdin.once("close", () => void shutdownBridgeProcess(0));
+process.once("exit", () => {
   stopDefaultAttractRuntime();
+});
+
+async function shutdownBridgeProcess(exitCode: number) {
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+
+  const runtime = stopDefaultAttractRuntime();
   if (roomCleanupTimer) clearInterval(roomCleanupTimer);
-  process.exit(0);
+  roomCleanupTimer = null;
+
+  await Promise.all([closeBridgeServer(), waitForAttractRuntimeStop(runtime, 5_000)]);
+  process.exit(exitCode);
+}
+
+function closeBridgeServer(timeoutMs = 5_000) {
+  const server = bridgeServer;
+  bridgeServer = null;
+  if (!server || !server.listening) return Promise.resolve();
+
+  closeRoomEventStreams();
+  return new Promise<void>((resolve) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve();
+    };
+    timer = setTimeout(() => {
+      server.closeAllConnections();
+      done();
+    }, timeoutMs);
+    server.close(done);
+  });
+}
+
+function closeRoomEventStreams() {
+  for (const room of rooms.values()) {
+    for (const client of Array.from(room.sseClients)) {
+      try {
+        client.end();
+      } catch {
+        // Closing stale event streams is best effort.
+      }
+    }
+    room.sseClients.clear();
+  }
 }
 
 function startBridge() {
@@ -1095,6 +1146,7 @@ function startBridge() {
       });
     }
   });
+  bridgeServer = server;
 
   server.on("error", (error) => {
     console.error(`Paperclip Battler bridge unavailable on port ${BRIDGE_PORT}:`, error);
@@ -1849,6 +1901,21 @@ async function startDefaultAttractRuntime(roomId: string) {
     emitRoomEvent(roomId, "attract-error", { roomId, message: defaultAttractRuntime.lastError });
     return;
   }
+  const watchdogCommand = resolveAttractWatchdogCommand();
+  if (!watchdogCommand) {
+    defaultAttractRuntime = {
+      roomId,
+      browsers: [],
+      profileDirs: [],
+      startedAt: Date.now(),
+      stopping: false,
+      gameOverAt: null,
+      lastError: "No attract browser watchdog runner was found.",
+      restartTimer: null
+    };
+    emitRoomEvent(roomId, "attract-error", { roomId, message: defaultAttractRuntime.lastError });
+    return;
+  }
 
   const runtime: DefaultAttractRuntime = {
     roomId,
@@ -1880,9 +1947,19 @@ async function startDefaultAttractRuntime(roomId: string) {
       `--user-data-dir=${profileDir}`,
       playerUrl.toString()
     ];
-    const browser = spawn(browserCommand.command, browserArgs, {
-      stdio: ["ignore", "ignore", "pipe"],
+    const watchdogConfig = JSON.stringify({
+      parentPid: process.pid,
+      command: browserCommand.command,
+      args: browserArgs,
+      profileDir,
+      label: ATTRACT_PROCESS_LABEL
+    });
+    const browser = spawn(watchdogCommand.command, [...watchdogCommand.args, watchdogConfig], {
+      stdio: ["pipe", "ignore", "pipe"],
       windowsHide: true
+    });
+    browser.stdin?.on("error", () => {
+      // The watchdog may already have exited while shutdown is in progress.
     });
 
     runtime.browsers.push(browser);
@@ -1913,7 +1990,7 @@ async function startDefaultAttractRuntime(roomId: string) {
 
 function stopDefaultAttractRuntime(roomId?: string) {
   const runtime = defaultAttractRuntime;
-  if (!runtime || (roomId && runtime.roomId !== roomId)) return;
+  if (!runtime || (roomId && runtime.roomId !== roomId)) return null;
 
   runtime.stopping = true;
   if (runtime.restartTimer) {
@@ -1921,7 +1998,7 @@ function stopDefaultAttractRuntime(roomId?: string) {
     runtime.restartTimer = null;
   }
   for (const browser of runtime.browsers) {
-    if (browser.exitCode === null) browser.kill();
+    shutdownAttractProcess(browser);
   }
   if (runtime.browsers.every((browser) => browser.exitCode !== null)) {
     for (const profileDir of runtime.profileDirs) {
@@ -1929,6 +2006,41 @@ function stopDefaultAttractRuntime(roomId?: string) {
     }
   }
   if (defaultAttractRuntime === runtime) defaultAttractRuntime = null;
+  return runtime;
+}
+
+function shutdownAttractProcess(browser: ReturnType<typeof spawn>) {
+  if (browser.exitCode !== null) return;
+
+  if (browser.stdin?.writable) {
+    browser.stdin.end("shutdown\n");
+    return;
+  }
+
+  browser.kill();
+}
+
+function waitForAttractRuntimeStop(runtime: DefaultAttractRuntime | null, timeoutMs: number) {
+  if (!runtime) return Promise.resolve();
+  const running = runtime.browsers.filter((browser) => browser.exitCode === null);
+  if (!running.length) return Promise.resolve();
+
+  return new Promise<void>((resolve) => {
+    let remaining = running.length;
+    const timer = setTimeout(resolve, timeoutMs);
+
+    const done = () => {
+      remaining -= 1;
+      if (remaining <= 0) {
+        clearTimeout(timer);
+        resolve();
+      }
+    };
+
+    for (const browser of running) {
+      browser.once("exit", done);
+    }
+  });
 }
 
 function scheduleDefaultAttractRestart(roomId: string) {
@@ -1948,6 +2060,22 @@ async function cleanupAttractProfile(profileDir: string) {
   } catch {
     // Temporary browser profiles are best-effort cleanup.
   }
+}
+
+function resolveAttractWatchdogCommand(): BrowserCommand | null {
+  const label = `${ATTRACT_PROCESS_LABEL}-watchdog`;
+  const compiledScript = join(SERVER_DIR, "attract-browser-watchdog.js");
+  if (existsSync(compiledScript)) {
+    return { command: process.execPath, args: [`--title=${label}`, compiledScript] };
+  }
+
+  const sourceScript = join(SERVER_DIR, "attract-browser-watchdog.ts");
+  const tsxCli = join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
+  if (existsSync(sourceScript) && existsSync(tsxCli)) {
+    return { command: process.execPath, args: [`--title=${label}`, tsxCli, sourceScript] };
+  }
+
+  return null;
 }
 
 function resolveAttractBrowserCommand(): BrowserCommand | null {
