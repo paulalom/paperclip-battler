@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -41,6 +41,12 @@ const DEFAULT_ATTRACT_ENABLED = !["0", "false", "no", "off"].includes(
 );
 const DEFAULT_ATTRACT_RESTART_DELAY_MS = Number(process.env.PAPERCLIP_DEFAULT_ATTRACT_RESTART_DELAY_MS ?? 1_000);
 const ATTRACT_BROWSER_RESTART_MS = Number(process.env.PAPERCLIP_ATTRACT_BROWSER_RESTART_MS ?? 3_000);
+const ATTRACT_PROFILE_MANIFEST = ".paperclip-battler-profile.json";
+const ATTRACT_PROFILE_CLEANUP_INTERVAL_MS = positiveMs(
+  process.env.PAPERCLIP_ATTRACT_PROFILE_CLEANUP_INTERVAL_MS,
+  60_000
+);
+const STALE_ATTRACT_PROFILE_TTL_MS = positiveMs(process.env.PAPERCLIP_STALE_ATTRACT_PROFILE_TTL_MS, 2 * 60_000);
 const MAX_JSON_BODY_SIZE = 5_000_000;
 const PAPERCLIP_CLICK_RATE_LIMIT_LABEL = "10 clicks per second per session";
 const RATE_LIMIT_CLEANUP_INTERVAL_MS = 60_000;
@@ -67,6 +73,11 @@ function sanitizeProcessLabel(value: unknown) {
     .replace(/^-+|-+$/g, "")
     .slice(0, 80);
   return label || "paperclip-battler";
+}
+
+function positiveMs(value: unknown, fallback: number) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 const INSTRUCTION_MODES = ["none", "paul", "codex"] as const;
@@ -369,6 +380,7 @@ let defaultLobby: { roomId: string; createdAt: number } | null = null;
 let defaultAttractRuntime: DefaultAttractRuntime | null = null;
 let defaultAttractLaunch: Promise<void> | null = null;
 let roomCleanupTimer: ReturnType<typeof setInterval> | null = null;
+let attractProfileCleanupTimer: ReturnType<typeof setInterval> | null = null;
 let bridgeServer: ReturnType<typeof createServer> | null = null;
 let shutdownStarted = false;
 let lastRateLimitCleanupAt = Date.now();
@@ -760,6 +772,8 @@ async function shutdownBridgeProcess(exitCode: number) {
   const runtime = stopDefaultAttractRuntime();
   if (roomCleanupTimer) clearInterval(roomCleanupTimer);
   roomCleanupTimer = null;
+  if (attractProfileCleanupTimer) clearInterval(attractProfileCleanupTimer);
+  attractProfileCleanupTimer = null;
 
   await Promise.all([closeBridgeServer(), waitForAttractRuntimeStop(runtime, 5_000)]);
   process.exit(exitCode);
@@ -803,6 +817,7 @@ function closeRoomEventStreams() {
 
 function startBridge() {
   startRoomCleanupTimer();
+  startAttractProfileCleanupTimer();
 
   const server = createServer(async (request, response) => {
     setCors(response);
@@ -1999,6 +2014,7 @@ async function startDefaultAttractRuntime(roomId: string) {
 
   for (const playerId of PLAYER_IDS) {
     const profileDir = await mkdtemp(join(tmpdir(), `${ATTRACT_PROCESS_LABEL}-room-${roomId}-player-${playerId}-`));
+    await writeAttractProfileManifest(profileDir, roomId, playerId);
     const playerUrl = new URL(`http://127.0.0.1:${BRIDGE_PORT}/rooms/${roomId}/players/${playerId}/${ORIGINAL_ENTRY}`);
     playerUrl.searchParams.set("attract", "1");
     playerUrl.searchParams.set("process", ATTRACT_PROCESS_LABEL);
@@ -2127,6 +2143,105 @@ async function cleanupAttractProfile(profileDir: string) {
     await rm(profileDir, { recursive: true, force: true });
   } catch {
     // Temporary browser profiles are best-effort cleanup.
+  }
+}
+
+function startAttractProfileCleanupTimer() {
+  if (attractProfileCleanupTimer) return;
+
+  void cleanupStaleAttractProfiles();
+  attractProfileCleanupTimer = setInterval(() => {
+    void cleanupStaleAttractProfiles();
+  }, ATTRACT_PROFILE_CLEANUP_INTERVAL_MS);
+  attractProfileCleanupTimer.unref();
+}
+
+async function cleanupStaleAttractProfiles(now = Date.now()) {
+  let entries: Array<{ isDirectory(): boolean; name: string }>;
+  try {
+    entries = await readdir(tmpdir(), { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  const activeProfileDirs = new Set(
+    (defaultAttractRuntime?.profileDirs ?? []).map((profileDir) => normalizeProfileDir(profileDir))
+  );
+
+  await Promise.all(
+    entries
+      .filter((entry) => entry.isDirectory() && isPaperclipBrowserProfileDir(entry.name))
+      .map(async (entry) => {
+        const profileDir = join(tmpdir(), entry.name);
+        if (activeProfileDirs.has(normalizeProfileDir(profileDir))) return;
+
+        const profileStat = await statProfileDir(profileDir);
+        if (!profileStat) return;
+        if (now - Math.max(profileStat.ctimeMs, profileStat.mtimeMs) < STALE_ATTRACT_PROFILE_TTL_MS) return;
+
+        const manifest = await readAttractProfileManifest(profileDir);
+        if (manifest?.bridgePid && isPidAlive(manifest.bridgePid)) return;
+
+        await cleanupAttractProfile(profileDir);
+      })
+  );
+}
+
+async function writeAttractProfileManifest(profileDir: string, roomId: string, playerId: PlayerId) {
+  const manifest = {
+    label: ATTRACT_PROCESS_LABEL,
+    bridgePid: process.pid,
+    roomId,
+    playerId,
+    createdAt: Date.now()
+  };
+
+  try {
+    await writeFile(join(profileDir, ATTRACT_PROFILE_MANIFEST), JSON.stringify(manifest, null, 2), "utf8");
+  } catch {
+    // Temporary browser profile metadata is best-effort.
+  }
+}
+
+async function readAttractProfileManifest(profileDir: string) {
+  try {
+    const manifest = JSON.parse(await readFile(join(profileDir, ATTRACT_PROFILE_MANIFEST), "utf8")) as {
+      bridgePid?: unknown;
+    };
+    return {
+      bridgePid: Number.isInteger(manifest.bridgePid) ? (manifest.bridgePid as number) : null
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function statProfileDir(profileDir: string) {
+  try {
+    return await stat(profileDir);
+  } catch {
+    return null;
+  }
+}
+
+function isPaperclipBrowserProfileDir(name: string) {
+  return (
+    name.startsWith(`${ATTRACT_PROCESS_LABEL}-room-`) ||
+    name.startsWith("paperclip-battler-attract-room-") ||
+    /^paperclip-battler-[A-Za-z0-9_-]+-(?:left|right)-[A-Za-z0-9_-]+$/.test(name)
+  );
+}
+
+function normalizeProfileDir(profileDir: string) {
+  return process.platform === "win32" ? profileDir.toLowerCase() : profileDir;
+}
+
+function isPidAlive(pid: number) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
   }
 }
 
