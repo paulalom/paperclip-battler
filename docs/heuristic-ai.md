@@ -32,13 +32,11 @@ Each broad decision tick tries these rules in order and stops after the first su
    - If wire cost is `10` or lower, buy early until wire reaches `10,000`.
 
 2. Paperclip price management
-   - Price rules read visible/global `unsoldClips`, `demand`, and `margin`. If inventory cannot be read, skip price management for that tick.
+   - Price rules read visible/global `unsoldClips` and `margin`. If inventory cannot be read, skip price management for that tick.
    - Price adjustments share a 3 second cooldown on `price:adjust`, so they cannot monopolize broad decision ticks.
    - Rules are evaluated in this order and stop after the first successful allowed button click.
-   - If public demand is `5%` or lower, click `lower` when the price is unknown or above `$0.01`.
-   - If unsold inventory is above `150`, click `lower`.
-   - If unsold inventory is above `75` while demand is below `20%`, click `lower` when the price is unknown or above `$0.01`.
-   - If unsold inventory is below `50` and demand is unknown or at least `20%`, click `raise`.
+   - If unsold inventory is above `150`, click `lower` only when price is readable and the next one-cent reduction would keep price at or above `$0.03`.
+   - If unsold inventory is below `50`, click `raise`.
    - Otherwise, including inventory from `50` through `150`, leave price alone.
 
 3. Tournament, probe, and trust management

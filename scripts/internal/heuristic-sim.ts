@@ -69,8 +69,7 @@ type Action =
 const WIRE_STALL_BELOW = 1;
 const WIRE_SAVE_BELOW = 500;
 const WIRE_RESERVE = 20;
-const LOW_DEMAND = 5;
-const HEALTHY_DEMAND = 20;
+const MIN_PRICE = 0.03;
 const PROBE_TARGETS: ProbeStats = {
   Speed: 1,
   Nav: 1,
@@ -146,6 +145,10 @@ function visibleProjectOperationCosts(state: SimState) {
   return costs.sort((left, right) => left - right);
 }
 
+function lowerPriceWouldRespectFloor(price: number) {
+  return Math.round((price - 0.01) * 100) / 100 >= MIN_PRICE;
+}
+
 function chooseAction(state: SimState): Action {
   if (state.phase === "complete") return "wait";
 
@@ -156,10 +159,8 @@ function chooseAction(state: SimState): Action {
 
   if (state.phase === "business") {
     const canAdjustPrice = state.tick - state.lastPriceTick >= 4;
-    if (canAdjustPrice && state.demand <= LOW_DEMAND && state.price > 0.01) return "lower-price";
-    if (canAdjustPrice && state.inventory > 150) return "lower-price";
-    if (canAdjustPrice && state.inventory > 75 && state.demand < HEALTHY_DEMAND && state.price > 0.01) return "lower-price";
-    if (canAdjustPrice && state.inventory < 50 && state.demand >= HEALTHY_DEMAND) return "raise-price";
+    if (canAdjustPrice && state.inventory > 150 && lowerPriceWouldRespectFloor(state.price)) return "lower-price";
+    if (canAdjustPrice && state.inventory < 50) return "raise-price";
 
     if (state.wireCost <= 14 && state.wire < 2000 && state.funds >= state.wireCost) return "buy-wire";
 
@@ -222,7 +223,7 @@ function applyAction(state: SimState, action: Action) {
       break;
     case "lower-price":
       state.lastPriceTick = state.tick;
-      state.price = Math.max(0.01, state.price - 0.01);
+      state.price = Math.max(MIN_PRICE, state.price - 0.01);
       state.demand = Math.min(100, state.demand + 3);
       break;
     case "raise-price":
@@ -373,11 +374,25 @@ function runScenarioChecks() {
   reserve.lastPriceTick = 0;
   assertScenario("wire reserve blocks cash spend", reserve, "wait");
 
-  const lowDemand = initialState();
-  lowDemand.inventory = 0;
-  lowDemand.demand = 1;
-  lowDemand.price = 8;
-  assertScenario("low demand lowers price", lowDemand, "lower-price");
+  const lowInventory = initialState();
+  lowInventory.inventory = 0;
+  lowInventory.demand = 1;
+  assertScenario("low inventory raises price", lowInventory, "raise-price");
+
+  const highInventory = initialState();
+  highInventory.inventory = 200;
+  highInventory.price = 0.04;
+  assertScenario("high inventory lowers price above floor", highInventory, "lower-price");
+
+  const priceFloor = initialState();
+  priceFloor.inventory = 200;
+  priceFloor.price = MIN_PRICE;
+  assertScenario("price floor blocks lower price", priceFloor, "wait");
+
+  const fractionalFloor = initialState();
+  fractionalFloor.inventory = 200;
+  fractionalFloor.price = 0.034;
+  assertScenario("fractional price floor blocks lower price", fractionalFloor, "wait");
 
   const trust = initialState();
   trust.trust = 10;

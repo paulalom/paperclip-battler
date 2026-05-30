@@ -3557,9 +3557,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   const HEURISTIC_WIRE_STALL_BELOW = 1;
   const HEURISTIC_WIRE_SAVE_BELOW = 500;
   const HEURISTIC_AVERAGE_WIRE_COST = 20;
-  const HEURISTIC_LOW_DEMAND = 5;
-  const HEURISTIC_HEALTHY_DEMAND = 20;
-  const HEURISTIC_MIN_PRICE = 0.01;
+  const HEURISTIC_MIN_PRICE = 0.03;
   const HEURISTIC_PROBE_TARGETS = {
     Speed: 1,
     Nav: 1,
@@ -4101,28 +4099,16 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
 
   const runPriceHeuristic = () => {
     const unsoldClips = readGameNumber("unsoldClips", "unsoldClips");
-    const demand = readGameNumber("demand", "demand");
     const margin = readGameNumber("margin", "margin");
+    const lowerPriceWouldRespectFloor =
+      margin !== null && Math.round((margin - 0.01) * 100) / 100 >= HEURISTIC_MIN_PRICE;
     if (unsoldClips === null) return false;
 
-    if (demand !== null && demand <= HEURISTIC_LOW_DEMAND && (margin === null || margin > HEURISTIC_MIN_PRICE)) {
+    if (unsoldClips > 150 && lowerPriceWouldRespectFloor) {
       return clickHeuristicElement(document.getElementById("btnLowerPrice"), "price:adjust", HEURISTIC_PRICE_COOLDOWN_MS);
     }
 
-    if (unsoldClips > 150) {
-      return clickHeuristicElement(document.getElementById("btnLowerPrice"), "price:adjust", HEURISTIC_PRICE_COOLDOWN_MS);
-    }
-
-    if (
-      unsoldClips > 75 &&
-      demand !== null &&
-      demand < HEURISTIC_HEALTHY_DEMAND &&
-      (margin === null || margin > HEURISTIC_MIN_PRICE)
-    ) {
-      return clickHeuristicElement(document.getElementById("btnLowerPrice"), "price:adjust", HEURISTIC_PRICE_COOLDOWN_MS);
-    }
-
-    if (unsoldClips < 50 && (demand === null || demand >= HEURISTIC_HEALTHY_DEMAND)) {
+    if (unsoldClips < 50) {
       return clickHeuristicElement(document.getElementById("btnRaisePrice"), "price:adjust", HEURISTIC_PRICE_COOLDOWN_MS);
     }
 
