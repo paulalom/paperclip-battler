@@ -3331,6 +3331,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   const HEURISTIC_BRIDGE_TICK_STALE_MS = 2000;
   const REPORT_MIN_INTERVAL_MS = 500;
   const HEURISTIC_WIRE_BUY_COOLDOWN_MS = 750;
+  const HEURISTIC_WIRE_STALL_BELOW = 1;
   const HEURISTIC_WIRE_SAVE_BELOW = 500;
   const HEURISTIC_AVERAGE_WIRE_COST = 20;
   const HEURISTIC_WIRE_LOW_PRICE_RULES = [
@@ -3818,7 +3819,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     const buyWireButton = document.getElementById("btnBuyWire");
     const canAffordWire = funds !== null && wireCost !== null && funds >= wireCost;
 
-    if (wire !== null && wire < 1) {
+    if (wire !== null && wire < HEURISTIC_WIRE_STALL_BELOW) {
       if (canAffordWire) {
         clickHeuristicElement(buyWireButton, "wire:empty", HEURISTIC_WIRE_BUY_COOLDOWN_MS);
         return true;

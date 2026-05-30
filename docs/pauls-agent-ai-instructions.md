@@ -5,7 +5,7 @@ This is an optional playbook for Paperclip Battler sessions. Only use it when re
 ## Strategy
 
 - Early game: manually make clips until clicking is generating <20% of clips/second. Click around 8 times per second. This is fair, I can click 11 times per second. Keep a minimal stockpile, lowering price if holding more than 100 paperclips. Never lower price below $.03 until tech reduces the cost of wire below .01/clip ($10 per 1000)
-- buy wire when <1000 and price is <18 or if you hit 0 or if wire price is <=$12 (up to 3000)
+- buy wire when <1000 and price is <18, or force-buy wire when it drops below 1 inch and the spool is affordable, or if wire price is <=$12 (up to 3000)
 - After ~5-10 autoclippers start buying wire when <5000 and price is <=16
 - Don't buy revtracker. Use first ops to get more processors. only buy exactly enough memory to get the important projects, as a low priority.
 - Focus on projects that actually increase profit. Faster autoclippers only increases revenue if we have a throughput problem, while wire extruders directly increase profit by reducing expenses.
