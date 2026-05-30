@@ -3331,6 +3331,8 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   const HEURISTIC_BRIDGE_TICK_STALE_MS = 2000;
   const REPORT_MIN_INTERVAL_MS = 500;
   const HEURISTIC_WIRE_BUY_COOLDOWN_MS = 750;
+  const HEURISTIC_WIRE_SAVE_BELOW = 500;
+  const HEURISTIC_AVERAGE_WIRE_COST = 20;
   const HEURISTIC_WIRE_LOW_PRICE_RULES = [
     { maxCost: 10, targetWire: 10000 },
     { maxCost: 12, targetWire: 5000 },
@@ -3775,6 +3777,30 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     setGameText("clipperCost", readGameNumber("clipperCost", "clipperCost"), 2);
   };
 
+  const readWireState = () => ({
+    wire: readGameNumber("wire", "wire"),
+    wireCost: readGameNumber("wireCost", "wireCost"),
+    funds: readGameNumber("funds", "funds")
+  });
+
+  const knownButtonCashCost = (button) => {
+    const id = normalizeText(button.id || button.elementId).toLowerCase();
+    if (id === "btnmakeclipper") return readGameNumber("clipperCost", "clipperCost");
+    if (id === "btnexpandmarketing") return readGameNumber("adCost", "adCost");
+    if (id === "btnmakemegaclipper") return readGameNumber("megaClipperCost", "megaClipperCost");
+    return null;
+  };
+
+  const preservesWireReserve = (button) => {
+    const { wire, funds } = readWireState();
+    if (wire === null || wire >= HEURISTIC_WIRE_SAVE_BELOW || funds === null) return true;
+
+    const cashCost = knownButtonCashCost(button);
+    if (cashCost === null || cashCost <= 0) return true;
+
+    return funds - cashCost >= HEURISTIC_AVERAGE_WIRE_COST;
+  };
+
   const clickHeuristicElement = (element, cooldownKey, cooldownMs) => {
     if (!element || !visible(element) || element.disabled) return false;
     const now = Date.now();
@@ -3788,19 +3814,29 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   };
 
   const runWireHeuristic = () => {
-    const wire = readGameNumber("wire", "wire");
+    const { wire, wireCost, funds } = readWireState();
     const buyWireButton = document.getElementById("btnBuyWire");
+    const canAffordWire = funds !== null && wireCost !== null && funds >= wireCost;
 
     if (wire !== null && wire < 1) {
-      if (clickHeuristicElement(buyWireButton, "wire:empty", HEURISTIC_WIRE_BUY_COOLDOWN_MS)) return true;
-      return clickHeuristicElement(wireRecoveryProjectElement(), "wire:beg", 1800);
+      if (canAffordWire) {
+        clickHeuristicElement(buyWireButton, "wire:empty", HEURISTIC_WIRE_BUY_COOLDOWN_MS);
+        return true;
+      }
+
+      if (funds !== null && wireCost !== null && funds < wireCost) {
+        return clickHeuristicElement(wireRecoveryProjectElement(), "wire:beg", 1800);
+      }
+
+      return false;
     }
 
-    const wireCost = readGameNumber("wireCost", "wireCost");
     const lowPriceRule = HEURISTIC_WIRE_LOW_PRICE_RULES.find((rule) => wireCost !== null && wireCost <= rule.maxCost);
     if (!lowPriceRule || wire === null || wire >= lowPriceRule.targetWire) return false;
+    if (!canAffordWire) return false;
 
-    return clickHeuristicElement(buyWireButton, "wire:low:" + lowPriceRule.maxCost, HEURISTIC_WIRE_BUY_COOLDOWN_MS);
+    clickHeuristicElement(buyWireButton, "wire:low:" + lowPriceRule.maxCost, HEURISTIC_WIRE_BUY_COOLDOWN_MS);
+    return true;
   };
 
   const runPriceHeuristic = () => {
@@ -3824,6 +3860,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     if (!button.visible || button.disabled) return null;
     if (isManualPaperclipButton(button)) return null;
     if (isBuyWireButton(button)) return null;
+    if (!preservesWireReserve(button)) return null;
     const haystack = [button.id, button.text, button.title, button.value].map(normalizeText).join(" ");
     if (!haystack || HEURISTIC_SKIP_PATTERN.test(haystack)) return null;
 
