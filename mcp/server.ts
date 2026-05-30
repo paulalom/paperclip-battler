@@ -18,7 +18,6 @@ const REPORT_STALE_MS = 8_000;
 const CLAIM_TTL_MS = Number(process.env.PAPERCLIP_PLAYER_CLAIM_TTL_MS ?? 10 * 60 * 1000);
 const DEFAULT_ROOM_ID = "local";
 const ROOM_ID_LENGTH = 6;
-const ROOM_EVENT_HISTORY_LIMIT = 80;
 const DEFAULT_LOBBY_TTL_MS = Number(process.env.PAPERCLIP_DEFAULT_LOBBY_TTL_MS ?? 30 * 60 * 1000);
 const COMPLETED_ROOM_TTL_MS = Number(process.env.PAPERCLIP_COMPLETED_ROOM_TTL_MS ?? 5 * 60 * 1000);
 const IDLE_ROOM_TTL_MS = Number(process.env.PAPERCLIP_IDLE_ROOM_TTL_MS ?? 60 * 60 * 1000);
@@ -324,7 +323,6 @@ type RoomState = {
   tinyState: Record<string, unknown>;
   playerStates: Map<PlayerId, PlayerState>;
   participants: Map<string, RoomParticipant>;
-  events: RoomEvent[];
   nextEventId: number;
   sseClients: Set<ServerResponse>;
 };
@@ -356,7 +354,6 @@ let roomCleanupTimer: ReturnType<typeof setInterval> | null = null;
 let lastRateLimitCleanupAt = Date.now();
 const rateLimitBuckets = new Map<string, RateLimitBucket>();
 const commandWaiters = new Map<string, (result: AgentCommandResult) => void>();
-const commandResults = new Map<string, AgentCommandResult>();
 
 const mcpServer = new McpServer({
   name: "paperclip-battler",
@@ -1586,7 +1583,6 @@ function createRoomState(roomId: string, title?: string): RoomState {
     tinyState: {},
     playerStates: createPlayerStates(),
     participants: new Map(),
-    events: [],
     nextEventId: 1,
     sseClients: new Set()
   };
@@ -2182,7 +2178,6 @@ function serializeRoom(roomId: string) {
     playerCount: playerParticipants.length,
     observerCount: observerParticipants.length,
     participants: participants.map((participant) => serializeRoomParticipant(participant, false)),
-    eventCount: room.events.length,
     snapshotCount: PLAYER_IDS.filter((playerId) => Boolean(getPlayerState(roomId, playerId).latestReport)).length,
     slots: Object.fromEntries(
       PLAYER_IDS.map((playerId) => {
@@ -2201,8 +2196,7 @@ function serializeRoom(roomId: string) {
           }
         ];
       })
-    ),
-    events: room.events
+    )
   };
 }
 
@@ -2708,7 +2702,6 @@ function completeCommand(result: AgentCommandResult) {
     ...result,
     at: typeof result.at === "number" ? result.at : Date.now()
   };
-  commandResults.set(normalized.id, normalized);
   const waiter = commandWaiters.get(normalized.id);
   if (waiter) {
     commandWaiters.delete(normalized.id);
@@ -3188,8 +3181,6 @@ function emitRoomEvent(roomId: string, type: string, payload: unknown) {
   };
   room.nextEventId += 1;
   room.updatedAt = event.at;
-  room.events.push(event);
-  if (room.events.length > ROOM_EVENT_HISTORY_LIMIT) room.events.splice(0, room.events.length - ROOM_EVENT_HISTORY_LIMIT);
 
   const message = `id: ${event.id}\nevent: ${type}\ndata: ${JSON.stringify(event)}\n\n`;
   for (const client of Array.from(room.sseClients)) {

@@ -148,7 +148,6 @@ type BridgeRoom = {
   playerCount: number;
   observerCount: number;
   participants: BridgeRoomParticipant[];
-  eventCount: number;
   snapshotCount: number;
   slots: Partial<Record<PlayerId, BridgeRoomSlot>>;
 };
