@@ -21,7 +21,8 @@ The heuristic AI is a deterministic browser controller for Universal Paperclips.
 Each broad decision tick tries these rules in order and stops after the first successful click.
 
 1. Wire management
-   - If wire is `0`, click `Wire` at any price.
+   - If wire is below `1`, click `Wire` at any price.
+   - If wire is below `1` and `Wire` cannot be clicked, click `Beg for More Wire` when that recovery project is available.
    - If wire cost is `14` or lower, buy early until wire reaches `2,000`.
    - If wire cost is `12` or lower, buy early until wire reaches `5,000`.
    - If wire cost is `10` or lower, buy early until wire reaches `10,000`.

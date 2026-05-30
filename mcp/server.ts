@@ -1451,6 +1451,50 @@ function createSpectatorControllerScript(roomId: string, playerId: PlayerId) {
     return true;
   };
 
+  const readSavedGame = () => {
+    try {
+      const saved = JSON.parse(window.localStorage.getItem("saveGame") || "null");
+      return saved && typeof saved === "object" && !Array.isArray(saved) ? saved : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const gameFormat = (value, decimals = 0) => {
+    if (value === null || typeof value === "undefined") return null;
+    const number = Number(value);
+    if (!Number.isFinite(number)) return null;
+    if (typeof window.formatWithCommas === "function") return window.formatWithCommas(number, decimals);
+    return number.toLocaleString(undefined, {
+      minimumFractionDigits: decimals,
+      maximumFractionDigits: decimals
+    });
+  };
+
+  const setText = (id, value, decimals = 0) => {
+    const element = document.getElementById(id);
+    const text = gameFormat(value, decimals);
+    if (element && text !== null) element.textContent = text;
+  };
+
+  const syncVisibleStatsFromSave = () => {
+    const saved = readSavedGame();
+    if (!saved) return;
+
+    setText("wire", saved.wire);
+    setText("wireCost", saved.wireCost);
+    setText("clips", Math.ceil(Number(saved.clips || 0)));
+    setText("funds", saved.funds, 2);
+    setText("unsoldClips", saved.unsoldClips);
+    setText("margin", saved.margin, 2);
+    setText("clipmakerRate", Math.round(Number(saved.clipmakerRate || 0)));
+    setText("clipmakerLevel2", saved.clipmakerLevel);
+    setText("clipperCost", saved.clipperCost, 2);
+    setText("marketingLvl", saved.marketingLvl);
+    setText("adCost", saved.adCost, 2);
+    if (Number.isFinite(Number(saved.demand))) setText("demand", Number(saved.demand) * 10);
+  };
+
   const blockTrustedInput = (event) => {
     if (!event.isTrusted) return;
     event.preventDefault();
@@ -1517,7 +1561,10 @@ function createSpectatorControllerScript(roomId: string, playerId: PlayerId) {
       const save = normalizeSave(payload?.saves?.[PLAYER_ID]);
       if (!save) return;
       const signature = saveSignature(save);
-      if (signature === lastSaveSignature) return;
+      if (signature === lastSaveSignature) {
+        syncVisibleStatsFromSave();
+        return;
+      }
       applySave(save);
       window.location.reload();
     } catch {
@@ -1531,6 +1578,7 @@ function createSpectatorControllerScript(roomId: string, playerId: PlayerId) {
 
   const start = () => {
     installInputGuards();
+    syncVisibleStatsFromSave();
     syncSave();
     window.setInterval(syncSave, ${SPECTATOR_SAVE_SYNC_INTERVAL_MS});
     document.addEventListener("visibilitychange", () => {
@@ -3682,9 +3730,49 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     document.getElementById("btnMakePaperclip") ||
     buttonElements().find((element) => normalizeText(buttonText(element)).toLowerCase() === "make paperclip");
 
+  const wireRecoveryProjectElement = () =>
+    buttonElements().find((element) => /beg\s+for\s+more\s+wire/i.test(normalizeText(buttonText(element))));
+
   const parseGameNumber = (value) => {
     const parsed = Number.parseFloat(String(value || "").replace(/,/g, "").replace(/[^0-9.+-]/g, ""));
     return Number.isFinite(parsed) ? parsed : null;
+  };
+
+  const readGameNumber = (globalName, elementId) => {
+    const fromGlobal = parseGameNumber(window[globalName]);
+    if (fromGlobal !== null) return fromGlobal;
+    return parseGameNumber(document.getElementById(elementId)?.textContent);
+  };
+
+  const formatGameNumber = (value, decimals = 0) => {
+    if (value === null || typeof value === "undefined") return null;
+    const number = Number(value);
+    if (!Number.isFinite(number)) return null;
+    if (typeof window.formatWithCommas === "function") return window.formatWithCommas(number, decimals);
+    return number.toLocaleString(undefined, {
+      minimumFractionDigits: decimals,
+      maximumFractionDigits: decimals
+    });
+  };
+
+  const setGameText = (id, value, decimals = 0) => {
+    const element = document.getElementById(id);
+    const text = formatGameNumber(value, decimals);
+    if (element && text !== null) element.textContent = text;
+  };
+
+  const syncVisibleStatsFromGlobals = () => {
+    const clips = readGameNumber("clips", "clips");
+    const clipmakerRate = readGameNumber("clipmakerRate", "clipmakerRate");
+    setGameText("wire", readGameNumber("wire", "wire"));
+    setGameText("wireCost", readGameNumber("wireCost", "wireCost"));
+    setGameText("clips", clips === null ? null : Math.ceil(clips));
+    setGameText("funds", readGameNumber("funds", "funds"), 2);
+    setGameText("unsoldClips", readGameNumber("unsoldClips", "unsoldClips"));
+    setGameText("margin", readGameNumber("margin", "margin"), 2);
+    setGameText("clipmakerRate", clipmakerRate === null ? null : Math.round(clipmakerRate));
+    setGameText("clipmakerLevel2", readGameNumber("clipmakerLevel", "clipmakerLevel2"));
+    setGameText("clipperCost", readGameNumber("clipperCost", "clipperCost"), 2);
   };
 
   const clickHeuristicElement = (element, cooldownKey, cooldownMs) => {
@@ -3700,14 +3788,15 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   };
 
   const runWireHeuristic = () => {
-    const wire = parseGameNumber(document.getElementById("wire")?.textContent);
+    const wire = readGameNumber("wire", "wire");
     const buyWireButton = document.getElementById("btnBuyWire");
 
-    if (wire !== null && wire <= 0) {
-      return clickHeuristicElement(buyWireButton, "wire:empty", HEURISTIC_WIRE_BUY_COOLDOWN_MS);
+    if (wire !== null && wire < 1) {
+      if (clickHeuristicElement(buyWireButton, "wire:empty", HEURISTIC_WIRE_BUY_COOLDOWN_MS)) return true;
+      return clickHeuristicElement(wireRecoveryProjectElement(), "wire:beg", 1800);
     }
 
-    const wireCost = parseGameNumber(document.getElementById("wireCost")?.textContent);
+    const wireCost = readGameNumber("wireCost", "wireCost");
     const lowPriceRule = HEURISTIC_WIRE_LOW_PRICE_RULES.find((rule) => wireCost !== null && wireCost <= rule.maxCost);
     if (!lowPriceRule || wire === null || wire >= lowPriceRule.targetWire) return false;
 
@@ -3715,7 +3804,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   };
 
   const runPriceHeuristic = () => {
-    const unsoldClips = parseGameNumber(document.getElementById("unsoldClips")?.textContent);
+    const unsoldClips = readGameNumber("unsoldClips", "unsoldClips");
     if (unsoldClips === null) return false;
 
     if (unsoldClips > 150) {
@@ -3763,6 +3852,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
 
   const runHeuristicTick = () => {
     if (!heuristicCanAct() || !allPlayersReady) return;
+    syncVisibleStatsFromGlobals();
     if (runWireHeuristic()) return;
     if (runPriceHeuristic()) return;
 
@@ -3831,6 +3921,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     lastReportAt = Date.now();
 
     try {
+      syncVisibleStatsFromGlobals();
       await fetch(REPORT_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
