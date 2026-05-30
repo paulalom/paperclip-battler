@@ -217,6 +217,7 @@ type AgentButton = {
   text: string;
   disabled: boolean;
   visible: boolean;
+  allowed?: boolean;
   selector: string;
   elementId: string | null;
   title: string;
@@ -239,6 +240,7 @@ type AgentControl = {
   checked: boolean;
   disabled: boolean;
   visible: boolean;
+  allowed?: boolean;
   selector: string;
   elementId: string | null;
   options?: string[];
@@ -598,7 +600,9 @@ mcpServer.registerTool(
   async ({ room, player, claimToken, controller, includeDisabled }) => {
     const roomId = normalizeRoomId(room);
     const playerId = normalizePlayerId(player);
-    const buttons = getFreshReport(roomId, playerId).buttons.filter((button) => includeDisabled || !button.disabled);
+    const buttons = getFreshReport(roomId, playerId).buttons.filter(
+      (button) => button.visible && (includeDisabled || isAllowedAgentButton(button))
+    );
     const claim = maybeEnsurePlayerClaim(roomId, playerId, { claimToken, controller, source: "mcp" });
     return textJson({ room: serializeRoom(roomId), player: getPlayerMeta(roomId, playerId), claim: serializeClaim(claim, true), buttons });
   }
@@ -659,7 +663,9 @@ mcpServer.registerTool(
   async ({ room, player, claimToken, controller, includeDisabled }) => {
     const roomId = normalizeRoomId(room);
     const playerId = normalizePlayerId(player);
-    const controls = getFreshReport(roomId, playerId).controls.filter((control) => includeDisabled || !control.disabled);
+    const controls = getFreshReport(roomId, playerId).controls.filter(
+      (control) => control.visible && (includeDisabled || isAllowedAgentControl(control))
+    );
     const claim = maybeEnsurePlayerClaim(roomId, playerId, { claimToken, controller, source: "mcp" });
     return textJson({ room: serializeRoom(roomId), player: getPlayerMeta(roomId, playerId), claim: serializeClaim(claim, true), controls });
   }
@@ -861,7 +867,7 @@ function startBridge() {
       if (request.method === "GET" && url.pathname === "/buttons") {
         const roomId = resolveUrlRoomId(url);
         const playerId = normalizePlayerId(url.searchParams.get("player") ?? "right");
-        sendJson(response, 200, getPlayerState(roomId, playerId).latestReport?.buttons ?? []);
+        sendJson(response, 200, getPlayerState(roomId, playerId).latestReport?.buttons.filter(isAllowedAgentButton) ?? []);
         return;
       }
 
@@ -1341,12 +1347,74 @@ async function proxyPlayerAsset(
     return;
   }
 
+  if (contentType.includes("javascript")) {
+    const script = patchOriginalScript(relativePath, await upstream.text());
+    response.writeHead(200, {
+      "Content-Type": contentType,
+      "Cache-Control": "no-store"
+    });
+    response.end(script);
+    return;
+  }
+
   const body = Buffer.from(await upstream.arrayBuffer());
   response.writeHead(200, {
     "Content-Type": contentType,
     "Cache-Control": "no-store"
   });
   response.end(body);
+}
+
+function patchOriginalScript(relativePath: string, source: string) {
+  const normalizedPath = relativePath.replace(/\\/g, "/").toLowerCase();
+  if (normalizedPath !== "main.js") return source;
+  return patchRevenueTrackerScript(source);
+}
+
+function patchRevenueTrackerScript(source: string) {
+  let patched = source.replace(
+    /var incomeThen;\s*var incomeNow;\s*var trueAvgRev;\s*var revTimer = 0;\s*var avgSales;\s*var incomeLastSecond;\s*var sum;/,
+    [
+      "var incomeThen = 0;",
+      "var incomeNow = 0;",
+      "var trueAvgRev = 0;",
+      "var revTimer = 0;",
+      "var avgSales = 0;",
+      "var incomeLastSecond = 0;",
+      "var sum = 0;"
+    ].join("\n")
+  );
+
+  patched = patched.replace(
+    /function calculateRev\(\)\{\s*incomeThen = incomeNow;/,
+    [
+      "function calculateRev(){",
+      "    if (!Array.isArray(incomeTracker) || incomeTracker.length === 0) {",
+      "        incomeTracker = [0];",
+      "    }",
+      "    for (var paperclipBattlerTrackerIndex = 0; paperclipBattlerTrackerIndex < incomeTracker.length; paperclipBattlerTrackerIndex++){",
+      "        incomeTracker[paperclipBattlerTrackerIndex] = Number(incomeTracker[paperclipBattlerTrackerIndex]);",
+      "        if (!isFinite(incomeTracker[paperclipBattlerTrackerIndex])) {",
+      "            incomeTracker[paperclipBattlerTrackerIndex] = 0;",
+      "        }",
+      "    }",
+      "    if (!isFinite(Number(incomeNow))) { incomeNow = Number(income) || 0; }",
+      "    if (!isFinite(Number(incomeThen))) { incomeThen = incomeNow; }",
+      "    ",
+      "    incomeThen = incomeNow;"
+    ].join("\n")
+  );
+
+  patched = patched.replace(
+    "    avgSalesElement.innerHTML = formatWithCommas(Math.round(avgSales));",
+    [
+      "    if (!isFinite(avgRev)) { avgRev = 0; }",
+      "    if (!isFinite(avgSales)) { avgSales = 0; }",
+      "    avgSalesElement.innerHTML = formatWithCommas(Math.round(avgSales));"
+    ].join("\n")
+  );
+
+  return patched;
 }
 
 function injectPlayerController(html: string, roomId: string, playerId: PlayerId, assetMode: PlayerAssetMode = "player") {
@@ -2542,7 +2610,7 @@ function getPlayerBridgeState(roomId: string, playerId: PlayerId) {
     connected,
     agentConnected: connected,
     lastReportAt: state.latestReport?.at ?? null,
-    buttonCount: state.latestReport?.buttons.filter((button) => button.visible).length ?? 0,
+    buttonCount: state.latestReport?.buttons.filter(isAllowedAgentButton).length ?? 0,
     pendingCommand: state.pendingCommand
       ? {
           id: state.pendingCommand.id,
@@ -2632,9 +2700,17 @@ function summarizeReport(report: AgentReport | null) {
     url: report.url,
     title: report.title,
     visibleText: report.visibleText,
-    buttons: report.buttons,
-    controls: report.controls
+    buttons: report.buttons.filter(isAllowedAgentButton),
+    controls: report.controls.filter(isAllowedAgentControl)
   };
+}
+
+function isAllowedAgentButton(button: AgentButton) {
+  return button.visible && !button.disabled && button.allowed !== false;
+}
+
+function isAllowedAgentControl(control: AgentControl) {
+  return control.visible && !control.disabled && control.allowed !== false;
 }
 
 function getPlayerState(roomId: string, playerId: PlayerId) {
@@ -2799,7 +2875,7 @@ function resolveButton(
   }
 ) {
   const report = getFreshReport(roomId, playerId);
-  const available = report.buttons.filter((button) => button.visible);
+  const available = report.buttons.filter(isAllowedAgentButton);
   const normalizedText = text?.trim().toLowerCase();
 
   const button =
@@ -2814,7 +2890,7 @@ function resolveButton(
       : undefined);
 
   if (!button) {
-    throw new Error(`Could not find that button in the live ${PLAYER_LABELS[playerId]} pane.`);
+    throw new Error(`Could not find an enabled visible button in the live ${PLAYER_LABELS[playerId]} pane.`);
   }
 
   return button;
@@ -2834,7 +2910,7 @@ function resolveControl(
   }
 ) {
   const report = getFreshReport(roomId, playerId);
-  const available = report.controls.filter((control) => control.visible);
+  const available = report.controls.filter(isAllowedAgentControl);
   const normalizedLabel = label?.trim().toLowerCase();
 
   const control =
@@ -2850,7 +2926,7 @@ function resolveControl(
       : undefined);
 
   if (!control) {
-    throw new Error(`Could not find that control in the live ${PLAYER_LABELS[playerId]} pane.`);
+    throw new Error(`Could not find an enabled visible control in the live ${PLAYER_LABELS[playerId]} pane.`);
   }
 
   return control;
@@ -3698,16 +3774,48 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   };
 
   const visible = (element) => {
-    const style = window.getComputedStyle(element);
+    if (!(element instanceof Element)) return false;
+    if (element.closest("#paperclip-battler-input-shield,#paperclip-battler-input-tooltip")) return false;
+    if (element.hidden || element.getAttribute("type") === "hidden") return false;
+
+    for (let node = element; node && node.nodeType === 1; node = node.parentElement) {
+      if (node.hidden) return false;
+      const style = window.getComputedStyle(node);
+      if (style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse") return false;
+      if (Number(style.opacity) === 0) return false;
+    }
+
     const rect = element.getBoundingClientRect();
-    return (
-      style.display !== "none" &&
-      style.visibility !== "hidden" &&
-      Number(style.opacity) !== 0 &&
-      rect.width > 0 &&
-      rect.height > 0
-    );
+    if (element.getClientRects().length === 0 || rect.width <= 0 || rect.height <= 0) return false;
+    if (rect.bottom <= 0 || rect.right <= 0 || rect.top >= window.innerHeight || rect.left >= window.innerWidth) {
+      return false;
+    }
+
+    if (typeof document.elementsFromPoint !== "function") return true;
+
+    const points = [
+      [rect.left + rect.width / 2, rect.top + rect.height / 2],
+      [rect.left + 1, rect.top + 1],
+      [rect.right - 1, rect.top + 1],
+      [rect.left + 1, rect.bottom - 1],
+      [rect.right - 1, rect.bottom - 1]
+    ].filter(([x, y]) => x >= 0 && y >= 0 && x < window.innerWidth && y < window.innerHeight);
+
+    return points.some(([x, y]) => {
+      const top = document
+        .elementsFromPoint(x, y)
+        .find((candidate) => !candidate.closest("#paperclip-battler-input-shield,#paperclip-battler-input-tooltip"));
+      return Boolean(top && (top === element || element.contains(top)));
+    });
   };
+
+  const disabled = (element) =>
+    Boolean(element.disabled) ||
+    Boolean(element.closest("fieldset[disabled]")) ||
+    element.getAttribute("disabled") !== null ||
+    (element.getAttribute("aria-disabled") === "true" && element.dataset.paperclipBattlerUserLocked !== "true");
+
+  const allowed = (element) => visible(element) && !disabled(element);
 
   const buttonText = (element) =>
     normalizeText(
@@ -3761,10 +3869,8 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     for (const element of [...buttonElements(), ...controlElements()]) {
       if (locked) {
         element.setAttribute("data-paperclip-battler-user-locked", "true");
-        element.setAttribute("aria-disabled", "true");
       } else {
         element.removeAttribute("data-paperclip-battler-user-locked");
-        element.removeAttribute("aria-disabled");
       }
     }
   };
@@ -3865,12 +3971,15 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
       const rect = element.getBoundingClientRect();
       const selector = elementSelector(element, index);
       const text = buttonText(element);
+      const isVisible = visible(element);
+      const isDisabled = disabled(element);
       return {
         id: element.id || "button-" + index,
         index,
         text,
-        disabled: Boolean(element.disabled),
-        visible: visible(element),
+        disabled: isDisabled,
+        visible: isVisible,
+        allowed: isVisible && !isDisabled,
         selector,
         elementId: element.id || null,
         title: element.getAttribute("title") || "",
@@ -3900,7 +4009,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   const elementById = (id) => document.getElementById(id);
 
   const parseGameNumber = (value) => {
-    const parsed = Number.parseFloat(String(value || "").replace(/,/g, "").replace(/[^0-9.+-]/g, ""));
+    const parsed = Number.parseFloat(String(value ?? "").replace(/,/g, "").replace(/[^0-9.+-]/g, ""));
     return Number.isFinite(parsed) ? parsed : null;
   };
 
@@ -3910,39 +4019,8 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     return parseGameNumber(document.getElementById(elementId)?.textContent);
   };
 
-  const formatGameNumber = (value, decimals = 0) => {
-    if (value === null || typeof value === "undefined") return null;
-    const number = Number(value);
-    if (!Number.isFinite(number)) return null;
-    if (typeof window.formatWithCommas === "function") return window.formatWithCommas(number, decimals);
-    return number.toLocaleString(undefined, {
-      minimumFractionDigits: decimals,
-      maximumFractionDigits: decimals
-    });
-  };
-
-  const setGameText = (id, value, decimals = 0) => {
-    const element = document.getElementById(id);
-    const text = formatGameNumber(value, decimals);
-    if (element && text !== null) element.textContent = text;
-  };
-
-  const syncVisibleStatsFromGlobals = () => {
-    const clips = readGameNumber("clips", "clips");
-    const clipmakerRate = readGameNumber("clipmakerRate", "clipmakerRate");
-    setGameText("wire", readGameNumber("wire", "wire"));
-    setGameText("wireCost", readGameNumber("wireCost", "wireCost"));
-    setGameText("clips", clips === null ? null : Math.ceil(clips));
-    setGameText("funds", readGameNumber("funds", "funds"), 2);
-    setGameText("unsoldClips", readGameNumber("unsoldClips", "unsoldClips"));
-    setGameText("margin", readGameNumber("margin", "margin"), 2);
-    setGameText("clipmakerRate", clipmakerRate === null ? null : Math.round(clipmakerRate));
-    setGameText("clipmakerLevel2", readGameNumber("clipmakerLevel", "clipmakerLevel2"));
-    setGameText("clipperCost", readGameNumber("clipperCost", "clipperCost"), 2);
-  };
-
   const findEnabledVisibleElement = (...ids) =>
-    ids.map((id) => elementById(id)).find((element) => element && visible(element) && !element.disabled) || null;
+    ids.map((id) => elementById(id)).find((element) => element && allowed(element)) || null;
 
   const readWireState = () => ({
     wire: readGameNumber("wire", "wire"),
@@ -3970,7 +4048,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
 
   const visibleProjectOperationCosts = () =>
     collectButtons()
-      .filter((button) => button.visible && /projectbutton/i.test(button.id || button.elementId || ""))
+      .filter((button) => button.allowed && /projectbutton/i.test(button.id || button.elementId || ""))
       .map((button) => parseGameNumber((button.text.match(/\(([\d,]+)\s+ops\)/i) || [])[1]))
       .filter((cost) => cost !== null)
       .sort((left, right) => left - right);
@@ -3983,7 +4061,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   };
 
   const clickHeuristicElement = (element, cooldownKey, cooldownMs) => {
-    if (!element || !visible(element) || element.disabled) return false;
+    if (!element || !allowed(element)) return false;
     const now = Date.now();
     if ((heuristicCooldowns.get(cooldownKey) || 0) > now) return false;
 
@@ -4082,14 +4160,6 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   };
 
   const runTournamentHeuristic = () => {
-    const strategyPicker = elementById("stratPicker");
-    if (strategyPicker && visible(strategyPicker) && !strategyPicker.disabled && strategyPicker.value === "10") {
-      strategyPicker.value = "0";
-      dispatchValueEvents(strategyPicker);
-      scheduleReport(80);
-      return true;
-    }
-
     const tournamentButton = findEnabledVisibleElement("btnRunTournament", "btnNewTournament");
     return clickHeuristicElement(tournamentButton, "tournament:run", 900);
   };
@@ -4120,7 +4190,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   const heuristicKey = (button) => normalizeText(button.id || button.text || button.selector).toLowerCase();
 
   const heuristicDecisionForButton = (button) => {
-    if (!button.visible || button.disabled) return null;
+    if (!button.allowed) return null;
     if (isManualPaperclipButton(button)) return null;
     if (isBuyWireButton(button)) return null;
     if (!preservesWireReserve(button)) return null;
@@ -4152,7 +4222,6 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
 
   const runHeuristicTick = () => {
     if (!heuristicCanAct() || !allPlayersReady) return;
-    syncVisibleStatsFromGlobals();
     if (runWireHeuristic()) return;
     if (runPriceHeuristic()) return;
     if (runTournamentHeuristic()) return;
@@ -4169,7 +4238,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   const runManualPaperclipTick = () => {
     if (!heuristicCanAct() || !allPlayersReady) return;
     const element = manualPaperclipElement();
-    if (!element || !visible(element) || element.disabled) return;
+    if (!element || !allowed(element)) return;
 
     suppressClickReportUntil = Date.now() + 50;
     element.click();
@@ -4192,6 +4261,8 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   const collectControls = () =>
     controlElements().map((element, index) => {
       const selector = elementSelector(element, index);
+      const isVisible = visible(element);
+      const isDisabled = disabled(element);
       return {
         id: element.id || element.name || "control-" + index,
         index,
@@ -4200,8 +4271,9 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
         label: findLabel(element),
         value: element.value || "",
         checked: Boolean(element.checked),
-        disabled: Boolean(element.disabled),
-        visible: visible(element),
+        disabled: isDisabled,
+        visible: isVisible,
+        allowed: isVisible && !isDisabled,
         selector,
         elementId: element.id || null,
         options:
@@ -4224,7 +4296,6 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     lastReportAt = Date.now();
 
     try {
-      syncVisibleStatsFromGlobals();
       await fetch(REPORT_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -4264,7 +4335,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   };
 
   const findButton = (command) => {
-    const buttons = collectButtons();
+    const buttons = collectButtons().filter((button) => button.allowed);
     const text = normalizeText(command.text).toLowerCase();
     const target =
       buttons.find((button) => button.id === command.buttonId) ||
@@ -4277,7 +4348,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   };
 
   const findControl = (command) => {
-    const controls = collectControls();
+    const controls = collectControls().filter((control) => control.allowed);
     const target =
       controls.find((control) => control.id === command.controlId) ||
       controls.find((control) => control.selector === command.selector);
@@ -4316,7 +4387,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
         if (!allPlayersReady) throw new Error(playerReady ? "Waiting for the other player to be ready before actions can run." : "You need to be ready before taking actions.");
         const button = findButton(command);
         if (!button) throw new Error("Button not found.");
-        if (button.disabled) throw new Error("Button is disabled.");
+        if (!allowed(button)) throw new Error("Button is not currently available.");
         animateMcpPress(button);
         button.click();
         result.message = "Clicked " + buttonText(button) + ".";
@@ -4325,7 +4396,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
         if (!allPlayersReady) throw new Error(playerReady ? "Waiting for the other player to be ready before actions can run." : "You need to be ready before taking actions.");
         const control = findControl(command);
         if (!control) throw new Error("Control not found.");
-        if (control.disabled) throw new Error("Control is disabled.");
+        if (!allowed(control)) throw new Error("Control is not currently available.");
         if (control.type === "checkbox" || control.type === "radio") {
           control.checked = command.value === true || String(command.value).toLowerCase() === "true";
         } else {

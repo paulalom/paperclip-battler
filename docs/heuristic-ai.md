@@ -6,8 +6,9 @@ The heuristic AI is a deterministic browser controller for Universal Paperclips.
 
 - The player must be in `Heuristic` mode.
 - Both players must be ready.
-- A target button must be visible and enabled.
+- A target button must be visible, enabled, and reported as allowed by the same availability checks used by MCP commands.
 - Manual user game input stays locked while heuristic mode is active.
+- The heuristic only acts by clicking allowed buttons. It does not directly edit game globals, rewrite visible stat text, or set form control values.
 
 ## Timing
 
@@ -38,7 +39,7 @@ Each broad decision tick tries these rules in order and stops after the first su
    - Between `50` and `150`, leave price alone.
 
 3. Tournament, probe, and trust management
-   - If the strategy picker is still unset, select `RANDOM`; then run enabled tournaments to produce yomi.
+   - Run enabled tournaments to produce yomi.
    - In space, increase probe trust when possible, allocate probe trust toward replication, hazard resistance, exploration, speed, factories, harvesters, wire, and combat, then launch probes.
    - For computational trust, add memory when visible projects need a larger operations cap, add memory when the cap is full, otherwise keep processors and memory roughly balanced.
 
