@@ -3598,6 +3598,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   let lastReportAt = 0;
   let lastUserActivityAt = 0;
   let lastBridgeHeuristicTickAt = 0;
+  let lastManualPaperclipClickAt = 0;
   let suppressClickReportUntil = 0;
   let heuristicTickStream = null;
   const heuristicCooldowns = new Map();
@@ -4239,8 +4240,11 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     if (!heuristicCanAct() || !allPlayersReady) return;
     const element = manualPaperclipElement();
     if (!element || !allowed(element)) return;
+    const now = Date.now();
+    if (now - lastManualPaperclipClickAt < HEURISTIC_MANUAL_CLIP_TICK_MS) return;
 
-    suppressClickReportUntil = Date.now() + 50;
+    lastManualPaperclipClickAt = now;
+    suppressClickReportUntil = now + 50;
     element.click();
   };
 

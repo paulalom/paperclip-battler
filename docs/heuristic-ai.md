@@ -12,7 +12,8 @@ The heuristic AI is a deterministic browser controller for Universal Paperclips.
 
 ## Timing
 
-- Manual paperclip clicks run at 8 clicks per second, one `Make Paperclip` click every 125 ms.
+- Manual paperclip clicks run at no more than 8 clicks per second, one `Make Paperclip` click every 125 ms.
+- A page-local timestamp guard enforces the 125 ms minimum between manual clicks even if bridge ticks and browser fallback ticks arrive close together.
 - Broader AI decisions run every 750 ms.
 - If bridge-driven heuristic tick events are fresh, browser fallback timers stand down.
 - Status reports are coalesced so fast paperclip clicks do not create fast storage snapshots.
@@ -31,12 +32,14 @@ Each broad decision tick tries these rules in order and stops after the first su
    - If wire cost is `10` or lower, buy early until wire reaches `10,000`.
 
 2. Paperclip price management
-   - Price adjustments share a slower cooldown so they cannot monopolize broad decision ticks.
-   - If public demand is `5%` or lower, click `lower`.
+   - Price rules read visible/global `unsoldClips`, `demand`, and `margin`. If inventory cannot be read, skip price management for that tick.
+   - Price adjustments share a 3 second cooldown on `price:adjust`, so they cannot monopolize broad decision ticks.
+   - Rules are evaluated in this order and stop after the first successful allowed button click.
+   - If public demand is `5%` or lower, click `lower` when the price is unknown or above `$0.01`.
    - If unsold inventory is above `150`, click `lower`.
-   - If unsold inventory is above `75` while demand is below `20%`, click `lower`.
-   - If unsold inventory is below `50` and demand is at least `20%`, click `raise`.
-   - Between `50` and `150`, leave price alone.
+   - If unsold inventory is above `75` while demand is below `20%`, click `lower` when the price is unknown or above `$0.01`.
+   - If unsold inventory is below `50` and demand is unknown or at least `20%`, click `raise`.
+   - Otherwise, including inventory from `50` through `150`, leave price alone.
 
 3. Tournament, probe, and trust management
    - Run enabled tournaments to produce yomi.
