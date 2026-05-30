@@ -1648,9 +1648,15 @@ function createSpectatorControllerScript(roomId: string, playerId: PlayerId) {
 
   const blockTrustedInput = (event) => {
     if (!event.isTrusted) return;
+    if (isScrollGestureEvent(event)) return;
     event.preventDefault();
     event.stopImmediatePropagation();
   };
+
+  const isScrollGestureEvent = (event) =>
+    event.type === "wheel" ||
+    event.type.startsWith("touch") ||
+    (event.type.startsWith("pointer") && event.pointerType === "touch");
 
   const installStyles = () => {
     if (document.getElementById("paperclip-battler-spectator-style")) return;
@@ -1667,7 +1673,7 @@ function createSpectatorControllerScript(roomId: string, playerId: PlayerId) {
       "z-index: 2147483647 !important;",
       "cursor: not-allowed !important;",
       "background: rgba(255, 255, 255, 0) !important;",
-      "touch-action: none !important;",
+      "touch-action: pan-x pan-y !important;",
       "}",
       'html[data-paperclip-battler-spectator="true"] button:not(:disabled),',
       'html[data-paperclip-battler-spectator="true"] input:not([type="hidden"]):not(:disabled),',
@@ -3733,6 +3739,10 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     if (playerMode === "heuristic") return "Mouse input is locked while heuristic AI is running.";
     return "Mouse input is locked while this player is Agent-only.";
   };
+  const isScrollGestureEvent = (event) =>
+    event.type === "wheel" ||
+    event.type.startsWith("touch") ||
+    (event.type.startsWith("pointer") && event.pointerType === "touch");
 
   const installStyles = () => {
     const style = document.createElement("style");
@@ -3749,7 +3759,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
       "cursor: not-allowed !important;",
       "background: rgba(255, 255, 255, 0) !important;",
       "pointer-events: none !important;",
-      "touch-action: none !important;",
+      "touch-action: pan-x pan-y !important;",
       "}",
       "#paperclip-battler-input-tooltip {",
       "all: initial !important;",
@@ -4050,6 +4060,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
 
   const blockTrustedInput = (event) => {
     if (!userInputLocked() || !event.isTrusted) return;
+    if (isScrollGestureEvent(event)) return;
     if (event.type === "keydown" && event.key === "Tab") return;
     const target = closestInteractive(event.target);
     if (!target) return;
@@ -4066,6 +4077,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
 
   const blockShieldInput = (event) => {
     if (!userInputLocked() || !event.isTrusted) return;
+    if (isScrollGestureEvent(event)) return;
     event.preventDefault();
     event.stopImmediatePropagation();
     if (!inputShield) return;
@@ -4179,7 +4191,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
 
   const visibleProjectOperationCosts = () =>
     collectButtons()
-      .filter((button) => button.allowed && /projectbutton/i.test(button.id || button.elementId || ""))
+      .filter((button) => button.visible && /projectbutton/i.test(button.id || button.elementId || ""))
       .map((button) => parseGameNumber((button.text.match(/\(([\d,]+)\s+ops\)/i) || [])[1]))
       .filter((cost) => cost !== null)
       .sort((left, right) => left - right);
@@ -4312,6 +4324,43 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
 
   const heuristicKey = (button) => normalizeText(button.id || button.text || button.selector).toLowerCase();
 
+  const projectUpgradeDecisionForButton = (button) => {
+    if (!button.allowed || !/projectbutton/i.test(button.id || button.elementId || "")) return null;
+
+    const haystack = [button.id, button.text, button.title, button.value].map(normalizeText).join(" ");
+    if (!haystack || HEURISTIC_SKIP_PATTERN.test(haystack) || /rev\s*tracker|revtracker|tournament/i.test(haystack)) {
+      return null;
+    }
+
+    const resourceMatch = normalizeText(button.text).match(/\(([\d,]+(?:\.\d+)?)\s+(ops?|operations?|creativity)\)/i);
+    let score = 104;
+    if (resourceMatch) score += /creativity/i.test(resourceMatch[2]) ? 8 : 6;
+    if (/creativity|strategic|quantum|hypno|mega|marketing|wire|clipper/i.test(haystack)) score += 4;
+
+    return { score, cooldownMs: 900 };
+  };
+
+  const chooseHeuristicUpgrade = () => {
+    const now = Date.now();
+    return collectButtons()
+      .map((button) => {
+        const decision = projectUpgradeDecisionForButton(button);
+        if (!decision) return null;
+        const key = "upgrade:" + heuristicKey(button);
+        if ((heuristicCooldowns.get(key) || 0) > now) return null;
+        return { button, decision, key };
+      })
+      .filter(Boolean)
+      .sort((left, right) => right.decision.score - left.decision.score || left.button.index - right.button.index)[0];
+  };
+
+  const runUpgradeHeuristic = () => {
+    const target = chooseHeuristicUpgrade();
+    if (!target) return false;
+
+    return clickHeuristicElement(document.querySelector(target.button.selector), target.key, target.decision.cooldownMs);
+  };
+
   const heuristicDecisionForButton = (button) => {
     if (!button.allowed) return null;
     if (isManualPaperclipButton(button)) return null;
@@ -4347,9 +4396,10 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     if (!heuristicCanAct() || !allPlayersReady) return;
     if (runWireHeuristic()) return;
     if (runPriceHeuristic()) return;
-    if (runTournamentHeuristic()) return;
+    if (runUpgradeHeuristic()) return;
     if (runProbeHeuristic()) return;
     if (runTrustHeuristic()) return;
+    if (runTournamentHeuristic()) return;
 
     const target = chooseHeuristicButton();
     if (!target) return;

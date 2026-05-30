@@ -474,10 +474,6 @@ h1 {
   font-weight: 900;
 }
 
-.pane.read-only iframe {
-  pointer-events: none;
-}
-
 .watch-view {
   min-height: 0;
   display: grid;

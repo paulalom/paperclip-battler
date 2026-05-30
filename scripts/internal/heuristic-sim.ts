@@ -174,6 +174,22 @@ function sampleInventoryTrend(state: SimState) {
   return elapsedSeconds > 0 ? (state.inventory - oldest.inventory) / elapsedSeconds : 0;
 }
 
+function chooseBusinessProjectUpgrade(state: SimState): Action | null {
+  if (state.autoClippers >= 1 && state.operations >= 750 && !state.projects.has("improved-clippers")) {
+    return "project:improved-clippers";
+  }
+  if (state.operations >= 1000 && !state.projects.has("creativity")) return "project:creativity";
+  if (state.operations >= 12000 && state.creativity >= 250 && !state.projects.has("strategic-modeling")) {
+    return "project:strategic-modeling";
+  }
+  if (state.creativity >= 7500 && !state.projects.has("mega-marketing")) return "project:mega-marketing";
+  if (state.operations >= 70000 && state.projects.has("mega-marketing") && !state.projects.has("hypnodrones")) {
+    return "project:hypnodrones";
+  }
+  if (state.trust >= 100 && state.projects.has("hypnodrones")) return "project:release-hypnodrones";
+  return null;
+}
+
 function chooseAction(state: SimState): Action {
   if (state.phase === "complete") return "wait";
 
@@ -194,6 +210,9 @@ function chooseAction(state: SimState): Action {
 
     if (state.wireCost <= 14 && state.wire < 2000 && state.funds >= state.wireCost) return "buy-wire";
 
+    const projectUpgrade = chooseBusinessProjectUpgrade(state);
+    if (projectUpgrade) return projectUpgrade;
+
     const nextCapacityCost = visibleProjectOperationCosts(state).find((cost) => cost > maxOps(state));
     if (nextCapacityCost && state.trust > state.processors + state.memory && maxOps(state) < nextCapacityCost) return "add-memory";
     if (state.operations >= maxOps(state) * 0.92 && state.trust > state.processors + state.memory) return "add-memory";
@@ -202,17 +221,7 @@ function chooseAction(state: SimState): Action {
       return "add-memory";
     }
 
-    if (state.autoClippers >= 1 && state.operations >= 750 && !state.projects.has("improved-clippers")) {
-      return "project:improved-clippers";
-    }
-    if (state.operations >= 1000 && !state.projects.has("creativity")) return "project:creativity";
-    if (state.creativity >= 250 && !state.projects.has("strategic-modeling")) return "project:strategic-modeling";
     if (state.projects.has("strategic-modeling") && state.yomi < 100) return "run-tournament";
-    if (state.creativity >= 7500 && !state.projects.has("mega-marketing")) return "project:mega-marketing";
-    if (state.operations >= 70000 && state.projects.has("mega-marketing") && !state.projects.has("hypnodrones")) {
-      return "project:hypnodrones";
-    }
-    if (state.trust >= 100 && state.projects.has("hypnodrones")) return "project:release-hypnodrones";
 
     if (canSpendCash(state, state.clipperCost)) return "buy-clipper";
     if (canSpendCash(state, state.marketingCost)) return "buy-marketing";
@@ -438,6 +447,7 @@ function runScenarioChecks() {
   assertScenario("fractional price floor blocks lower price", fractionalFloor, "wait");
 
   const trust = initialState();
+  trust.projects.add("creativity");
   trust.trust = 10;
   trust.processors = 5;
   trust.memory = 1;
@@ -445,6 +455,21 @@ function runScenarioChecks() {
   trust.creativity = 250;
   trust.inventory = 60;
   assertScenario("trust buys memory for ops project capacity", trust, "add-memory");
+
+  const opsUpgrade = initialState();
+  opsUpgrade.autoClippers = 1;
+  opsUpgrade.operations = 750;
+  opsUpgrade.trust = 10;
+  opsUpgrade.inventory = 60;
+  assertScenario("affordable ops project beats trust allocation", opsUpgrade, "project:improved-clippers");
+
+  const creativityUpgrade = initialState();
+  creativityUpgrade.projects.add("creativity");
+  creativityUpgrade.projects.add("strategic-modeling");
+  creativityUpgrade.creativity = 7500;
+  creativityUpgrade.trust = 10;
+  creativityUpgrade.inventory = 60;
+  assertScenario("affordable creativity project beats trust allocation", creativityUpgrade, "project:mega-marketing");
 
   const emergency = initialState();
   emergency.wire = 0.2;

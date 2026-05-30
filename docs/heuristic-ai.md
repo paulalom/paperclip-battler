@@ -40,10 +40,11 @@ Each broad decision tick tries these rules in order and stops after the first su
    - If unsold inventory is below `50`, click `raise` only when inventory is not already increasing.
    - Otherwise, including inventory from `50` through `150`, leave price alone.
 
-3. Tournament, probe, and trust management
-   - Run enabled tournaments to produce yomi.
+3. Upgrade, probe, tournament, and trust management
+   - Click affordable project upgrades before repeatable buttons when they spend operations or creativity.
    - In space, increase probe trust when possible, allocate probe trust toward replication, hazard resistance, exploration, speed, factories, harvesters, wire, and combat, then launch probes.
    - For computational trust, add memory when visible projects need a larger operations cap, add memory when the cap is full, otherwise keep processors and memory roughly balanced.
+   - Run enabled tournaments after upgrade/probe/trust work so tournaments do not starve project purchases.
 
 4. Button-priority fallback
    - Prefer projects, probes, drones, factories, harvesters, tournaments, and strategy buttons.
