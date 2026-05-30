@@ -4,12 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite --host 127.0.0.1",
+    "dev": "node --title=paperclip-battler-vite ./node_modules/vite/bin/vite.js --host 127.0.0.1",
     "build": "tsc --noEmit && vite build && npm run mcp:build",
-    "preview": "vite preview --host 127.0.0.1",
+    "preview": "node --title=paperclip-battler-preview ./node_modules/vite/bin/vite.js preview --host 127.0.0.1",
     "mcp:build": "node -e \"require('node:fs').rmSync('dist-mcp',{recursive:true,force:true})\" && tsc -p tsconfig.mcp.json",
-    "mcp:dev": "tsx mcp/server.ts",
-    "mcp:start": "node dist-mcp/mcp/server.js"
+    "mcp:dev": "node --title=paperclip-battler-mcp-dev ./node_modules/tsx/dist/cli.mjs mcp/server.ts",
+    "mcp:start": "node --title=paperclip-battler-mcp dist-mcp/mcp/server.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.13.3",

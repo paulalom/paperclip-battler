@@ -32,6 +32,10 @@ const BRIDGE_HEURISTIC_DECISION_TICK_MS = Number(process.env.PAPERCLIP_HEURISTIC
 const BRIDGE_HEURISTIC_MANUAL_CLIP_TICK_MS = Number(process.env.PAPERCLIP_HEURISTIC_MANUAL_CLIP_TICK_MS ?? 125);
 const BRIDGE_HEURISTIC_TICK_HEARTBEAT_MS = 15_000;
 const DEFAULT_ATTRACT_TITLE = process.env.PAPERCLIP_DEFAULT_ATTRACT_TITLE ?? "Paperclip Battler";
+const PROCESS_TITLE = sanitizeProcessLabel(process.env.PAPERCLIP_PROCESS_TITLE ?? "paperclip-battler-mcp");
+const ATTRACT_PROCESS_LABEL = sanitizeProcessLabel(
+  process.env.PAPERCLIP_ATTRACT_PROCESS_LABEL ?? "paperclip-battler-attract"
+);
 const DEFAULT_ATTRACT_ENABLED = !["0", "false", "no", "off"].includes(
   String(process.env.PAPERCLIP_DEFAULT_ATTRACT ?? "1").toLowerCase()
 );
@@ -53,6 +57,18 @@ const CODEX_INSTRUCTION_PATHS = [
   join(SERVER_DIR, "..", "docs", "codex-agent-ai-instructions.md"),
   join(SERVER_DIR, "..", "..", "docs", "codex-agent-ai-instructions.md")
 ].filter(Boolean) as string[];
+
+process.title = PROCESS_TITLE;
+
+function sanitizeProcessLabel(value: unknown) {
+  const label = String(value ?? "")
+    .trim()
+    .replace(/[^A-Za-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+  return label || "paperclip-battler";
+}
+
 const INSTRUCTION_MODES = ["none", "paul", "codex"] as const;
 const PLAYER_IDS = ["left", "right"] as const;
 const PLAYER_REF_VALUES = ["left", "right", "player", "agent", "p1", "p2", "1", "2"] as const;
@@ -1847,8 +1863,10 @@ async function startDefaultAttractRuntime(roomId: string) {
   defaultAttractRuntime = runtime;
 
   for (const playerId of PLAYER_IDS) {
-    const profileDir = await mkdtemp(join(tmpdir(), `paperclip-battler-${roomId}-${playerId}-`));
-    const playerUrl = `http://127.0.0.1:${BRIDGE_PORT}/rooms/${roomId}/players/${playerId}/${ORIGINAL_ENTRY}?attract=1`;
+    const profileDir = await mkdtemp(join(tmpdir(), `${ATTRACT_PROCESS_LABEL}-room-${roomId}-player-${playerId}-`));
+    const playerUrl = new URL(`http://127.0.0.1:${BRIDGE_PORT}/rooms/${roomId}/players/${playerId}/${ORIGINAL_ENTRY}`);
+    playerUrl.searchParams.set("attract", "1");
+    playerUrl.searchParams.set("process", ATTRACT_PROCESS_LABEL);
     const browserArgs = [
       ...browserCommand.args,
       "--headless=new",
@@ -1860,7 +1878,7 @@ async function startDefaultAttractRuntime(roomId: string) {
       "--no-first-run",
       "--no-default-browser-check",
       `--user-data-dir=${profileDir}`,
-      playerUrl
+      playerUrl.toString()
     ];
     const browser = spawn(browserCommand.command, browserArgs, {
       stdio: ["ignore", "ignore", "pipe"],
