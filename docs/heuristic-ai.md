@@ -30,11 +30,19 @@ Each broad decision tick tries these rules in order and stops after the first su
    - If wire cost is `10` or lower, buy early until wire reaches `10,000`.
 
 2. Paperclip price management
+   - Price adjustments share a slower cooldown so they cannot monopolize broad decision ticks.
+   - If public demand is `5%` or lower, click `lower`.
    - If unsold inventory is above `150`, click `lower`.
-   - If unsold inventory is below `50`, click `raise`.
+   - If unsold inventory is above `75` while demand is below `20%`, click `lower`.
+   - If unsold inventory is below `50` and demand is at least `20%`, click `raise`.
    - Between `50` and `150`, leave price alone.
 
-3. Button-priority fallback
+3. Tournament, probe, and trust management
+   - If the strategy picker is still unset, select `RANDOM`; then run enabled tournaments to produce yomi.
+   - In space, increase probe trust when possible, allocate probe trust toward replication, hazard resistance, exploration, speed, factories, harvesters, wire, and combat, then launch probes.
+   - For computational trust, add memory when visible projects need a larger operations cap, add memory when the cap is full, otherwise keep processors and memory roughly balanced.
+
+4. Button-priority fallback
    - Prefer projects, probes, drones, factories, harvesters, tournaments, and strategy buttons.
    - Then prefer processors, memory, operations, compute, and quantum buttons.
    - Then prefer auto clipper and mega clipper buttons.
@@ -46,3 +54,8 @@ Each broad decision tick tries these rules in order and stops after the first su
 - Never click reset, restart, import, export, load, save, investment, deposit, or withdraw controls.
 - Do not let the generic button-priority fallback buy wire; wire buying is controlled only by the wire management rule.
 - Do not let the generic button-priority fallback click `Make Paperclip`; manual paperclip production has its own fast tick.
+
+## Simulation
+
+- Run `npm run heuristic:simulate` to execute deterministic scenario checks plus an abstract full-campaign simulation.
+- The simulation is intentionally cheap: it verifies that the heuristic policy can cross the main progression gates without rendering the browser game loop.

@@ -9,6 +9,7 @@
     "preview": "vite preview --host 127.0.0.1",
     "mcp:build": "tsc -p tsconfig.mcp.json",
     "mcp:dev": "tsx mcp/server.ts",
+    "heuristic:simulate": "tsx mcp/heuristic-sim.ts",
     "mcp:start": "node dist-mcp/mcp/server.js"
   },
   "dependencies": {

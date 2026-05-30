@@ -3330,10 +3330,25 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   const HEURISTIC_MANUAL_CLIP_TICK_MS = 125;
   const HEURISTIC_BRIDGE_TICK_STALE_MS = 2000;
   const REPORT_MIN_INTERVAL_MS = 500;
+  const HEURISTIC_PRICE_COOLDOWN_MS = 3000;
   const HEURISTIC_WIRE_BUY_COOLDOWN_MS = 750;
   const HEURISTIC_WIRE_STALL_BELOW = 1;
   const HEURISTIC_WIRE_SAVE_BELOW = 500;
   const HEURISTIC_AVERAGE_WIRE_COST = 20;
+  const HEURISTIC_LOW_DEMAND = 5;
+  const HEURISTIC_HEALTHY_DEMAND = 20;
+  const HEURISTIC_MIN_PRICE = 0.01;
+  const HEURISTIC_PROBE_TARGETS = {
+    Speed: 1,
+    Nav: 1,
+    Rep: 7,
+    Haz: 5,
+    Fac: 1,
+    Harv: 2,
+    Wire: 2,
+    Combat: 0
+  };
+  const HEURISTIC_PROBE_TARGET_ORDER = ["Rep", "Haz", "Nav", "Speed", "Fac", "Harv", "Wire", "Combat"];
   const HEURISTIC_WIRE_LOW_PRICE_RULES = [
     { maxCost: 10, targetWire: 10000 },
     { maxCost: 12, targetWire: 5000 },
@@ -3736,6 +3751,8 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   const wireRecoveryProjectElement = () =>
     buttonElements().find((element) => /beg\s+for\s+more\s+wire/i.test(normalizeText(buttonText(element))));
 
+  const elementById = (id) => document.getElementById(id);
+
   const parseGameNumber = (value) => {
     const parsed = Number.parseFloat(String(value || "").replace(/,/g, "").replace(/[^0-9.+-]/g, ""));
     return Number.isFinite(parsed) ? parsed : null;
@@ -3778,6 +3795,9 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     setGameText("clipperCost", readGameNumber("clipperCost", "clipperCost"), 2);
   };
 
+  const findEnabledVisibleElement = (...ids) =>
+    ids.map((id) => elementById(id)).find((element) => element && visible(element) && !element.disabled) || null;
+
   const readWireState = () => ({
     wire: readGameNumber("wire", "wire"),
     wireCost: readGameNumber("wireCost", "wireCost"),
@@ -3800,6 +3820,20 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     if (cashCost === null || cashCost <= 0) return true;
 
     return funds - cashCost >= HEURISTIC_AVERAGE_WIRE_COST;
+  };
+
+  const visibleProjectOperationCosts = () =>
+    collectButtons()
+      .filter((button) => button.visible && /projectbutton/i.test(button.id || button.elementId || ""))
+      .map((button) => parseGameNumber((button.text.match(/\(([\d,]+)\s+ops\)/i) || [])[1]))
+      .filter((cost) => cost !== null)
+      .sort((left, right) => left - right);
+
+  const probeValue = (suffix) => readGameNumber("probe" + suffix, "probe" + suffix + "Display") || 0;
+
+  const probeTarget = (suffix) => {
+    if (suffix === "Combat" && (readGameNumber("drifterCount", "drifterCount") || 0) > 0) return 5;
+    return HEURISTIC_PROBE_TARGETS[suffix] || 0;
   };
 
   const clickHeuristicElement = (element, cooldownKey, cooldownMs) => {
@@ -3842,17 +3876,99 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
 
   const runPriceHeuristic = () => {
     const unsoldClips = readGameNumber("unsoldClips", "unsoldClips");
+    const demand = readGameNumber("demand", "demand");
+    const margin = readGameNumber("margin", "margin");
     if (unsoldClips === null) return false;
 
-    if (unsoldClips > 150) {
-      return clickHeuristicElement(document.getElementById("btnLowerPrice"), "price:lower", 750);
+    if (demand !== null && demand <= HEURISTIC_LOW_DEMAND && (margin === null || margin > HEURISTIC_MIN_PRICE)) {
+      return clickHeuristicElement(document.getElementById("btnLowerPrice"), "price:adjust", HEURISTIC_PRICE_COOLDOWN_MS);
     }
 
-    if (unsoldClips < 50) {
-      return clickHeuristicElement(document.getElementById("btnRaisePrice"), "price:raise", 750);
+    if (unsoldClips > 150) {
+      return clickHeuristicElement(document.getElementById("btnLowerPrice"), "price:adjust", HEURISTIC_PRICE_COOLDOWN_MS);
+    }
+
+    if (
+      unsoldClips > 75 &&
+      demand !== null &&
+      demand < HEURISTIC_HEALTHY_DEMAND &&
+      (margin === null || margin > HEURISTIC_MIN_PRICE)
+    ) {
+      return clickHeuristicElement(document.getElementById("btnLowerPrice"), "price:adjust", HEURISTIC_PRICE_COOLDOWN_MS);
+    }
+
+    if (unsoldClips < 50 && (demand === null || demand >= HEURISTIC_HEALTHY_DEMAND)) {
+      return clickHeuristicElement(document.getElementById("btnRaisePrice"), "price:adjust", HEURISTIC_PRICE_COOLDOWN_MS);
     }
 
     return false;
+  };
+
+  const runTrustHeuristic = () => {
+    const addProcButton = findEnabledVisibleElement("btnAddProc");
+    const addMemButton = findEnabledVisibleElement("btnAddMem");
+    if (!addProcButton && !addMemButton) return false;
+
+    const processors = readGameNumber("processors", "processors") || 1;
+    const memory = readGameNumber("memory", "memory") || 1;
+    const operations = readGameNumber("operations", "operations") || 0;
+    const maxOps = memory * 1000;
+    const nextOpsCapacityCost = visibleProjectOperationCosts().find((cost) => cost > maxOps);
+
+    if (addMemButton && nextOpsCapacityCost && maxOps < nextOpsCapacityCost) {
+      return clickHeuristicElement(addMemButton, "trust:memory:project-capacity", 750);
+    }
+
+    if (addMemButton && operations >= maxOps * 0.92 && maxOps < 250000) {
+      return clickHeuristicElement(addMemButton, "trust:memory:full-capacity", 750);
+    }
+
+    if (addProcButton && processors < Math.max(5, memory)) {
+      return clickHeuristicElement(addProcButton, "trust:processors", 750);
+    }
+
+    if (addMemButton && memory <= processors && maxOps < 250000) {
+      return clickHeuristicElement(addMemButton, "trust:memory:balance", 750);
+    }
+
+    if (addProcButton) return clickHeuristicElement(addProcButton, "trust:processors:fallback", 750);
+    return clickHeuristicElement(addMemButton, "trust:memory:fallback", 750);
+  };
+
+  const runTournamentHeuristic = () => {
+    const strategyPicker = elementById("stratPicker");
+    if (strategyPicker && visible(strategyPicker) && !strategyPicker.disabled && strategyPicker.value === "10") {
+      strategyPicker.value = "0";
+      dispatchValueEvents(strategyPicker);
+      scheduleReport(80);
+      return true;
+    }
+
+    const tournamentButton = findEnabledVisibleElement("btnRunTournament", "btnNewTournament");
+    return clickHeuristicElement(tournamentButton, "tournament:run", 900);
+  };
+
+  const runProbeHeuristic = () => {
+    const probeTrust = readGameNumber("probeTrust", "probeTrustDisplay");
+    if (probeTrust === null) return false;
+
+    const usedTrust = readGameNumber("probeUsedTrust", "probeTrustUsedDisplay") || 0;
+    const increaseProbeTrustButton = findEnabledVisibleElement("btnIncreaseProbeTrust", "btnIncreaseMaxTrust");
+    if (increaseProbeTrustButton && usedTrust >= probeTrust) {
+      return clickHeuristicElement(increaseProbeTrustButton, "probe:trust", 900);
+    }
+
+    for (const suffix of HEURISTIC_PROBE_TARGET_ORDER) {
+      if (probeValue(suffix) >= probeTarget(suffix)) continue;
+      const raiseButton = findEnabledVisibleElement("btnRaiseProbe" + suffix);
+      if (raiseButton) return clickHeuristicElement(raiseButton, "probe:raise:" + suffix, 450);
+    }
+
+    if (increaseProbeTrustButton) {
+      return clickHeuristicElement(increaseProbeTrustButton, "probe:trust:surplus", 900);
+    }
+
+    return clickHeuristicElement(findEnabledVisibleElement("btnMakeProbe"), "probe:launch", 900);
   };
 
   const heuristicKey = (button) => normalizeText(button.id || button.text || button.selector).toLowerCase();
@@ -3893,6 +4009,9 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     syncVisibleStatsFromGlobals();
     if (runWireHeuristic()) return;
     if (runPriceHeuristic()) return;
+    if (runTournamentHeuristic()) return;
+    if (runProbeHeuristic()) return;
+    if (runTrustHeuristic()) return;
 
     const target = chooseHeuristicButton();
     if (!target) return;
