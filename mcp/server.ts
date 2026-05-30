@@ -3785,7 +3785,6 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
       'html[data-paperclip-battler-input-locked="true"] a[onclick],',
       'html[data-paperclip-battler-input-locked="true"] [role="button"] {',
       "cursor: not-allowed !important;",
-      "pointer-events: none !important;",
       "}",
       'html[data-paperclip-battler-input-locked="true"] [data-paperclip-battler-user-locked="true"]:hover {',
       "outline: 1px dashed #9b6a16 !important;",
