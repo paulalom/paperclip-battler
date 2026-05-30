@@ -3558,6 +3558,8 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   const HEURISTIC_WIRE_SAVE_BELOW = 500;
   const HEURISTIC_AVERAGE_WIRE_COST = 20;
   const HEURISTIC_MIN_PRICE = 0.03;
+  const HEURISTIC_INVENTORY_TREND_WINDOW_MS = 5000;
+  const HEURISTIC_INVENTORY_TREND_EPSILON = 0.001;
   const HEURISTIC_PROBE_TARGETS = {
     Speed: 1,
     Nav: 1,
@@ -3599,6 +3601,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   let lastManualPaperclipClickAt = 0;
   let suppressClickReportUntil = 0;
   let heuristicTickStream = null;
+  const inventorySamples = [];
   const heuristicCooldowns = new Map();
 
   const cssEscape = (value) => {
@@ -4045,6 +4048,21 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     return funds - cashCost >= HEURISTIC_AVERAGE_WIRE_COST;
   };
 
+  const sampleInventoryTrend = (inventory) => {
+    const now = Date.now();
+    inventorySamples.push({ at: now, inventory });
+    while (
+      inventorySamples.length > 1 &&
+      inventorySamples[0].at < now - HEURISTIC_INVENTORY_TREND_WINDOW_MS
+    ) {
+      inventorySamples.shift();
+    }
+
+    const oldest = inventorySamples[0];
+    const elapsedSeconds = (now - oldest.at) / 1000;
+    return elapsedSeconds > 0 ? (inventory - oldest.inventory) / elapsedSeconds : 0;
+  };
+
   const visibleProjectOperationCosts = () =>
     collectButtons()
       .filter((button) => button.allowed && /projectbutton/i.test(button.id || button.elementId || ""))
@@ -4104,11 +4122,15 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
       margin !== null && Math.round((margin - 0.01) * 100) / 100 >= HEURISTIC_MIN_PRICE;
     if (unsoldClips === null) return false;
 
-    if (unsoldClips > 150 && lowerPriceWouldRespectFloor) {
+    const inventoryTrendPerSecond = sampleInventoryTrend(unsoldClips);
+    const inventoryIsDecreasing = inventoryTrendPerSecond < -HEURISTIC_INVENTORY_TREND_EPSILON;
+    const inventoryIsIncreasing = inventoryTrendPerSecond > HEURISTIC_INVENTORY_TREND_EPSILON;
+
+    if (unsoldClips > 150 && lowerPriceWouldRespectFloor && !inventoryIsDecreasing) {
       return clickHeuristicElement(document.getElementById("btnLowerPrice"), "price:adjust", HEURISTIC_PRICE_COOLDOWN_MS);
     }
 
-    if (unsoldClips < 50) {
+    if (unsoldClips < 50 && !inventoryIsIncreasing) {
       return clickHeuristicElement(document.getElementById("btnRaisePrice"), "price:adjust", HEURISTIC_PRICE_COOLDOWN_MS);
     }
 

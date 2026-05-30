@@ -12,6 +12,11 @@ type ProbeStats = {
   Combat: number;
 };
 
+type InventorySample = {
+  tick: number;
+  inventory: number;
+};
+
 type SimState = {
   tick: number;
   lastPriceTick: number;
@@ -19,6 +24,7 @@ type SimState = {
   clips: number;
   funds: number;
   inventory: number;
+  inventorySamples: InventorySample[];
   demand: number;
   price: number;
   wire: number;
@@ -70,6 +76,10 @@ const WIRE_STALL_BELOW = 1;
 const WIRE_SAVE_BELOW = 500;
 const WIRE_RESERVE = 20;
 const MIN_PRICE = 0.03;
+const DECISION_TICK_MS = 750;
+const INVENTORY_TREND_WINDOW_MS = 5000;
+const INVENTORY_TREND_WINDOW_TICKS = Math.ceil(INVENTORY_TREND_WINDOW_MS / DECISION_TICK_MS);
+const INVENTORY_TREND_EPSILON = 0.001;
 const PROBE_TARGETS: ProbeStats = {
   Speed: 1,
   Nav: 1,
@@ -90,6 +100,7 @@ function initialState(): SimState {
     clips: 0,
     funds: 0,
     inventory: 0,
+    inventorySamples: [],
     demand: 32,
     price: 0.25,
     wire: 1000,
@@ -149,6 +160,20 @@ function lowerPriceWouldRespectFloor(price: number) {
   return Math.round((price - 0.01) * 100) / 100 >= MIN_PRICE;
 }
 
+function sampleInventoryTrend(state: SimState) {
+  state.inventorySamples.push({ tick: state.tick, inventory: state.inventory });
+  while (
+    state.inventorySamples.length > 1 &&
+    state.inventorySamples[0].tick < state.tick - INVENTORY_TREND_WINDOW_TICKS
+  ) {
+    state.inventorySamples.shift();
+  }
+
+  const oldest = state.inventorySamples[0];
+  const elapsedSeconds = ((state.tick - oldest.tick) * DECISION_TICK_MS) / 1000;
+  return elapsedSeconds > 0 ? (state.inventory - oldest.inventory) / elapsedSeconds : 0;
+}
+
 function chooseAction(state: SimState): Action {
   if (state.phase === "complete") return "wait";
 
@@ -159,8 +184,13 @@ function chooseAction(state: SimState): Action {
 
   if (state.phase === "business") {
     const canAdjustPrice = state.tick - state.lastPriceTick >= 4;
-    if (canAdjustPrice && state.inventory > 150 && lowerPriceWouldRespectFloor(state.price)) return "lower-price";
-    if (canAdjustPrice && state.inventory < 50) return "raise-price";
+    const inventoryTrendPerSecond = sampleInventoryTrend(state);
+    const inventoryIsDecreasing = inventoryTrendPerSecond < -INVENTORY_TREND_EPSILON;
+    const inventoryIsIncreasing = inventoryTrendPerSecond > INVENTORY_TREND_EPSILON;
+    if (canAdjustPrice && state.inventory > 150 && lowerPriceWouldRespectFloor(state.price) && !inventoryIsDecreasing) {
+      return "lower-price";
+    }
+    if (canAdjustPrice && state.inventory < 50 && !inventoryIsIncreasing) return "raise-price";
 
     if (state.wireCost <= 14 && state.wire < 2000 && state.funds >= state.wireCost) return "buy-wire";
 
@@ -383,6 +413,19 @@ function runScenarioChecks() {
   highInventory.inventory = 200;
   highInventory.price = 0.04;
   assertScenario("high inventory lowers price above floor", highInventory, "lower-price");
+
+  const decreasingInventory = initialState();
+  decreasingInventory.tick = 10;
+  decreasingInventory.inventory = 200;
+  decreasingInventory.inventorySamples = [{ tick: 3, inventory: 250 }];
+  decreasingInventory.price = 0.04;
+  assertScenario("decreasing inventory blocks lower price", decreasingInventory, "wait");
+
+  const increasingInventory = initialState();
+  increasingInventory.tick = 10;
+  increasingInventory.inventory = 40;
+  increasingInventory.inventorySamples = [{ tick: 3, inventory: 20 }];
+  assertScenario("increasing inventory blocks raise price", increasingInventory, "wait");
 
   const priceFloor = initialState();
   priceFloor.inventory = 200;

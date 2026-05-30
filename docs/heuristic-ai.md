@@ -33,10 +33,11 @@ Each broad decision tick tries these rules in order and stops after the first su
 
 2. Paperclip price management
    - Price rules read visible/global `unsoldClips` and `margin`. If inventory cannot be read, skip price management for that tick.
+   - Each price check samples unsold inventory into a rolling 5 second window and computes average inventory change per second.
    - Price adjustments share a 3 second cooldown on `price:adjust`, so they cannot monopolize broad decision ticks.
    - Rules are evaluated in this order and stop after the first successful allowed button click.
-   - If unsold inventory is above `150`, click `lower` only when price is readable and the next one-cent reduction would keep price at or above `$0.03`.
-   - If unsold inventory is below `50`, click `raise`.
+   - If unsold inventory is above `150`, click `lower` only when price is readable, the next one-cent reduction would keep price at or above `$0.03`, and inventory is not already decreasing.
+   - If unsold inventory is below `50`, click `raise` only when inventory is not already increasing.
    - Otherwise, including inventory from `50` through `150`, leave price alone.
 
 3. Tournament, probe, and trust management
