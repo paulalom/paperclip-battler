@@ -20,6 +20,13 @@ const DEFAULT_ROOM_ID = "local";
 const ROOM_ID_LENGTH = 6;
 const ROOM_EVENT_HISTORY_LIMIT = 80;
 const DEFAULT_LOBBY_TTL_MS = Number(process.env.PAPERCLIP_DEFAULT_LOBBY_TTL_MS ?? 30 * 60 * 1000);
+const COMPLETED_ROOM_TTL_MS = Number(process.env.PAPERCLIP_COMPLETED_ROOM_TTL_MS ?? 5 * 60 * 1000);
+const IDLE_ROOM_TTL_MS = Number(process.env.PAPERCLIP_IDLE_ROOM_TTL_MS ?? 60 * 60 * 1000);
+const IDLE_ROOM_WARNING_MS = Number(process.env.PAPERCLIP_IDLE_ROOM_WARNING_MS ?? 5 * 60 * 1000);
+const MAX_ROOM_AGE_MS = Number(process.env.PAPERCLIP_MAX_ROOM_AGE_MS ?? 24 * 60 * 60 * 1000);
+const MAX_ROOM_AGE_WARNING_MS = Number(process.env.PAPERCLIP_MAX_ROOM_AGE_WARNING_MS ?? 60 * 60 * 1000);
+const ROOM_CLEANUP_INTERVAL_MS = Number(process.env.PAPERCLIP_ROOM_CLEANUP_INTERVAL_MS ?? 5_000);
+const CLOSED_ROOM_TOMBSTONE_TTL_MS = Number(process.env.PAPERCLIP_CLOSED_ROOM_TOMBSTONE_TTL_MS ?? 60 * 60 * 1000);
 const ROOM_PARTICIPANT_TTL_MS = Number(process.env.PAPERCLIP_ROOM_PARTICIPANT_TTL_MS ?? 15_000);
 const SPECTATOR_SAVE_SYNC_INTERVAL_MS = 5_000;
 const BRIDGE_HEURISTIC_DECISION_TICK_MS = Number(process.env.PAPERCLIP_HEURISTIC_DECISION_TICK_MS ?? 750);
@@ -83,6 +90,25 @@ type RateLimitResult = {
   message: string;
 };
 
+type ClosedRoomRecord = {
+  roomId: string;
+  completedAt: number | null;
+  expiresAt: number | null;
+  closedAt: number;
+  reason: string;
+};
+
+type RoomWarningKind = "idle" | "max-age";
+
+type RoomWarning = {
+  kind: RoomWarningKind;
+  message: string;
+  action: string | null;
+  issuedAt: number;
+  closesAt: number;
+  ttlMs: number;
+};
+
 class RateLimitError extends Error {
   retryAfterMs: number;
 
@@ -90,6 +116,16 @@ class RateLimitError extends Error {
     super(result.message);
     this.name = "RateLimitError";
     this.retryAfterMs = result.retryAfterMs;
+  }
+}
+
+class RoomClosedError extends Error {
+  room: ClosedRoomRecord;
+
+  constructor(room: ClosedRoomRecord) {
+    super(`Lobby ${room.roomId} has closed.`);
+    this.name = "RoomClosedError";
+    this.room = room;
   }
 }
 
@@ -195,6 +231,7 @@ type AgentControl = {
 
 type AgentReport = {
   at: number;
+  lastUserActivityAt?: number;
   url: string;
   title: string;
   buttons: AgentButton[];
@@ -278,6 +315,12 @@ type RoomState = {
   title: string;
   createdAt: number;
   updatedAt: number;
+  lastActivityAt: number;
+  idleWarningSentAt: number | null;
+  maxAgeWarningSentAt: number | null;
+  gameStartedAt: number | null;
+  completedAt: number | null;
+  expiresAt: number | null;
   tinyState: Record<string, unknown>;
   playerStates: Map<PlayerId, PlayerState>;
   participants: Map<string, RoomParticipant>;
@@ -302,12 +345,14 @@ type DefaultAttractRuntime = {
   restartTimer: ReturnType<typeof setTimeout> | null;
 };
 
+const closedRooms = new Map<string, ClosedRoomRecord>();
 const rooms = new Map<string, RoomState>([[DEFAULT_ROOM_ID, createRoomState(DEFAULT_ROOM_ID, "Local Room")]]);
 
 let instructionMode: InstructionMode = "none";
 let defaultLobby: { roomId: string; createdAt: number } | null = null;
 let defaultAttractRuntime: DefaultAttractRuntime | null = null;
 let defaultAttractLaunch: Promise<void> | null = null;
+let roomCleanupTimer: ReturnType<typeof setInterval> | null = null;
 let lastRateLimitCleanupAt = Date.now();
 const rateLimitBuckets = new Map<string, RateLimitBucket>();
 const commandWaiters = new Map<string, (result: AgentCommandResult) => void>();
@@ -467,6 +512,7 @@ mcpServer.registerTool(
     const roomId = normalizeRoomId(room);
     const playerId = normalizePlayerId(player);
     const claim = ensurePlayerClaim(roomId, playerId, { claimToken, controller, source: "mcp" });
+    markRoomActivity(roomId);
     return textJson({ room: serializeRoom(roomId), player: getPlayerMeta(roomId, playerId), claim: serializeClaim(claim, true) });
   }
 );
@@ -486,6 +532,7 @@ mcpServer.registerTool(
     const roomId = normalizeRoomId(room);
     const playerId = normalizePlayerId(player);
     releasePlayerClaim(roomId, playerId, claimToken);
+    markRoomActivity(roomId);
     emitRoomEvent(roomId, "room", { player: getPlayerMeta(roomId, playerId) });
     return textJson({ ok: true, room: serializeRoom(roomId), player: getPlayerMeta(roomId, playerId) });
   }
@@ -507,7 +554,8 @@ mcpServer.registerTool(
     const roomId = normalizeRoomId(room);
     const playerId = normalizePlayerId(player);
     assertReadyChangeAllowed(roomId, playerId, claimToken, false);
-    getPlayerState(roomId, playerId).ready = ready;
+    setPlayerReadyState(roomId, playerId, ready);
+    markRoomActivity(roomId);
     emitRoomEvent(roomId, "room", { player: getPlayerMeta(roomId, playerId), allPlayersReady: allPlayersReady(roomId) });
     return textJson({
       ok: true,
@@ -679,10 +727,13 @@ process.once("SIGTERM", shutdownBridgeProcess);
 
 function shutdownBridgeProcess() {
   stopDefaultAttractRuntime();
+  if (roomCleanupTimer) clearInterval(roomCleanupTimer);
   process.exit(0);
 }
 
 function startBridge() {
+  startRoomCleanupTimer();
+
   const server = createServer(async (request, response) => {
     setCors(response);
 
@@ -716,9 +767,10 @@ function startBridge() {
       if (request.method === "POST" && url.pathname === "/rooms") {
         const body = await readJsonBody<{ id?: string; title?: string; tinyState?: Record<string, unknown> }>(request);
         const roomId = body.id ? normalizeRoomId(body.id) : createShortRoomId();
-        const room = getRoomState(roomId, body.title);
+        const room = getRoomState(roomId, body.title, { reopenClosed: true });
         if (body.title) room.title = normalizeRoomTitle(body.title, roomId);
         if (isRecord(body.tinyState)) room.tinyState = body.tinyState;
+        markRoomActivity(roomId);
         touchRoom(roomId);
         emitRoomEvent(roomId, "room", { room: serializeRoom(roomId) });
         sendJson(response, 201, { ok: true, room: serializeRoom(roomId) });
@@ -773,6 +825,7 @@ function startBridge() {
         const playerId = normalizePlayerId(body.player ?? url.searchParams.get("player") ?? "right");
         const mode = normalizePlayerMode(body.mode);
         getPlayerState(roomId, playerId).mode = mode;
+        markRoomActivity(roomId);
         touchRoom(roomId);
         emitRoomEvent(roomId, "room", { player: getPlayerMeta(roomId, playerId) });
         sendJson(response, 200, { ok: true, room: serializeRoom(roomId), player: getPlayerMeta(roomId, playerId), players: getPlayerModes(roomId) });
@@ -790,7 +843,8 @@ function startBridge() {
         const roomId = resolveBodyRoomId(url, body);
         const playerId = normalizePlayerId(body.player ?? url.searchParams.get("player") ?? "right");
         assertReadyChangeAllowed(roomId, playerId, body.claimToken, Boolean(body.force));
-        getPlayerState(roomId, playerId).ready = Boolean(body.ready);
+        setPlayerReadyState(roomId, playerId, Boolean(body.ready));
+        markRoomActivity(roomId);
         touchRoom(roomId);
         emitRoomEvent(roomId, "room", { player: getPlayerMeta(roomId, playerId), allPlayersReady: allPlayersReady(roomId) });
         sendJson(response, 200, {
@@ -808,8 +862,9 @@ function startBridge() {
         const roomId = resolveBodyRoomId(url, body);
         for (const playerId of PLAYER_IDS) {
           assertReadyChangeAllowed(roomId, playerId, undefined, true);
-          getPlayerState(roomId, playerId).ready = false;
         }
+        setAllPlayersReadyState(roomId, false);
+        markRoomActivity(roomId);
         touchRoom(roomId);
         emitRoomEvent(roomId, "room", { allPlayersReady: false, players: getPlayerModes(roomId) });
         sendJson(response, 200, { ok: true, room: serializeRoom(roomId), allPlayersReady: false, players: getPlayerModes(roomId) });
@@ -832,6 +887,7 @@ function startBridge() {
           controller: body.controller,
           source: "http"
         });
+        markRoomActivity(roomId);
         touchRoom(roomId);
         emitRoomEvent(roomId, "room", { player: getPlayerMeta(roomId, playerId) });
         sendJson(response, 200, { ok: true, room: serializeRoom(roomId), player: getPlayerMeta(roomId, playerId), claim: serializeClaim(claim, true) });
@@ -843,6 +899,7 @@ function startBridge() {
         const roomId = resolveBodyRoomId(url, body);
         const playerId = normalizePlayerId(body.player ?? url.searchParams.get("player") ?? "right");
         releasePlayerClaim(roomId, playerId, body.force ? undefined : body.claimToken, Boolean(body.force));
+        markRoomActivity(roomId);
         touchRoom(roomId);
         emitRoomEvent(roomId, "room", { player: getPlayerMeta(roomId, playerId) });
         sendJson(response, 200, { ok: true, room: serializeRoom(roomId), player: getPlayerMeta(roomId, playerId), claim: null });
@@ -943,6 +1000,7 @@ function startBridge() {
         const playerId = normalizePlayerId(url.searchParams.get("player") ?? "right");
         const report = normalizeReport(await readJsonBody<AgentReport>(request));
         getPlayerState(roomId, playerId).latestReport = report;
+        if (report.lastUserActivityAt) markRoomActivity(roomId, report.lastUserActivityAt);
         touchRoom(roomId);
         emitRoomEvent(roomId, "snapshot", { player: getPlayerMeta(roomId, playerId), report: summarizeReport(report) });
         handleDefaultAttractReport(roomId, playerId, report);
@@ -978,9 +1036,10 @@ function startBridge() {
         const roomId = resolveUrlRoomId(url);
         const playerId = normalizePlayerId(url.searchParams.get("player") ?? "right");
         const state = getPlayerState(roomId, playerId);
-        state.ready = false;
+        setPlayerReadyState(roomId, playerId, false);
         state.pendingCommand = { id: randomUUID(), type: "reset" };
         state.latestReport = null;
+        markRoomActivity(roomId);
         touchRoom(roomId);
         emitRoomEvent(roomId, "room", { player: getPlayerMeta(roomId, playerId), allPlayersReady: allPlayersReady(roomId) });
         sendJson(response, 200, { ok: true, room: serializeRoom(roomId), player: getPlayerMeta(roomId, playerId) });
@@ -1001,6 +1060,19 @@ function startBridge() {
     } catch (error) {
       if (error instanceof RateLimitError) {
         sendRateLimitError(response, error);
+        return;
+      }
+
+      if (error instanceof RoomClosedError) {
+        sendJson(response, 410, {
+          ok: false,
+          message: error.message,
+          roomId: error.room.roomId,
+          completedAt: error.room.completedAt,
+          expiresAt: error.room.expiresAt,
+          closedAt: error.room.closedAt,
+          reason: error.room.reason
+        });
         return;
       }
 
@@ -1063,6 +1135,14 @@ async function handleRoomPath(
     return true;
   }
 
+  if (request.method === "POST" && roomPath.kind === "rooms" && roomPath.rest === "/activity") {
+    const body = await readJsonBody<{ at?: number }>(request);
+    markRoomActivity(roomId, typeof body.at === "number" ? body.at : Date.now());
+    emitRoomEvent(roomId, "room", { room: serializeRoom(roomId), activity: true });
+    sendJson(response, 200, { ok: true, room: serializeRoom(roomId) });
+    return true;
+  }
+
   if (request.method === "GET" && roomPath.kind === "rooms" && roomPath.rest === "/events") {
     subscribeRoomEvents(roomId, request, response);
     return true;
@@ -1095,6 +1175,21 @@ async function handleRoomPath(
     return true;
   }
 
+  if (request.method === "POST" && roomPath.kind === "rooms" && roomPath.rest === "/complete") {
+    const body = await readJsonBody<unknown>(request);
+    const payload = isRecord(body) ? (isRecord(body.payload) ? body.payload : body) : {};
+    const result = completeRoom(roomId, payload);
+    sendJson(response, 200, {
+      ok: true,
+      room: serializeRoom(roomId),
+      event: result.event,
+      completedAt: result.completedAt,
+      expiresAt: result.expiresAt,
+      ttlMs: Math.max(0, result.expiresAt - Date.now())
+    });
+    return true;
+  }
+
   if (request.method === "GET" && roomPath.kind === "rooms" && roomPath.rest === "/save") {
     sendJson(response, 200, {
       ok: true,
@@ -1115,7 +1210,11 @@ async function handleRoomPath(
 
   if (request.method === "POST" && roomPath.kind === "rooms" && roomPath.rest === "/events") {
     const body = await readJsonBody<{ type?: string; payload?: unknown }>(request);
-    const event = emitRoomEvent(roomId, normalizeEventType(body.type), body.payload ?? null);
+    const type = normalizeEventType(body.type);
+    const event =
+      type === "game-over"
+        ? completeRoom(roomId, isRecord(body.payload) ? body.payload : {}).event
+        : emitRoomEvent(roomId, type, body.payload ?? null);
     sendJson(response, 200, { ok: true, room: serializeRoom(roomId), event });
     return true;
   }
@@ -1478,6 +1577,12 @@ function createRoomState(roomId: string, title?: string): RoomState {
     title: normalizeRoomTitle(title, roomId),
     createdAt: now,
     updatedAt: now,
+    lastActivityAt: now,
+    idleWarningSentAt: null,
+    maxAgeWarningSentAt: null,
+    gameStartedAt: null,
+    completedAt: null,
+    expiresAt: null,
     tinyState: {},
     playerStates: createPlayerStates(),
     participants: new Map(),
@@ -1487,8 +1592,17 @@ function createRoomState(roomId: string, title?: string): RoomState {
   };
 }
 
-function getRoomState(roomId: string, title?: string) {
+function getRoomState(roomId: string, title?: string, options: { reopenClosed?: boolean } = {}) {
   const normalized = normalizeRoomId(roomId);
+  const closedRoom = closedRooms.get(normalized);
+  if (closedRoom) {
+    if (options.reopenClosed) {
+      closedRooms.delete(normalized);
+    } else {
+      throw new RoomClosedError(closedRoom);
+    }
+  }
+
   let room = rooms.get(normalized);
   if (!room) {
     room = createRoomState(normalized, title);
@@ -1501,6 +1615,19 @@ function touchRoom(roomId: string) {
   getRoomState(roomId).updatedAt = Date.now();
 }
 
+function markRoomActivity(roomId: string, at = Date.now()) {
+  const room = getRoomState(roomId);
+  if (room.completedAt) return room;
+
+  const activityAt = Math.min(Date.now(), at);
+  if (activityAt <= room.lastActivityAt) return room;
+
+  room.lastActivityAt = activityAt;
+  room.updatedAt = Date.now();
+  room.idleWarningSentAt = null;
+  return room;
+}
+
 function getBridgeState(roomId = DEFAULT_ROOM_ID) {
   const room = getRoomState(roomId);
   const players = Object.fromEntries(PLAYER_IDS.map((playerId) => [playerId, getPlayerBridgeState(roomId, playerId)]));
@@ -1509,6 +1636,8 @@ function getBridgeState(roomId = DEFAULT_ROOM_ID) {
     ok: true,
     room: serializeRoom(roomId),
     roomId,
+    gameStartedAt: room.gameStartedAt,
+    elapsedGameMs: elapsedGameMs(room),
     roomUrl: `http://127.0.0.1:${BRIDGE_PORT}/rooms/${room.id}`,
     watchUrl: `http://127.0.0.1:${BRIDGE_PORT}/watch/${room.id}`,
     bridgeUrl: `http://127.0.0.1:${BRIDGE_PORT}`,
@@ -1593,8 +1722,9 @@ function ensureDefaultAttractRoom(room: RoomState) {
       changed = true;
     }
   }
+  const clockChanged = updateGameClock(room.id);
 
-  if (changed) touchRoom(room.id);
+  if (changed || clockChanged) touchRoom(room.id);
   void ensureDefaultAttractRuntime(room.id);
 }
 
@@ -1823,7 +1953,7 @@ function handleDefaultAttractReport(roomId: string, playerId: PlayerId, report: 
     nextRoomId: nextRoom.id,
     restartDelayMs: DEFAULT_ATTRACT_RESTART_DELAY_MS
   };
-  emitRoomEvent(roomId, "game-over", payload);
+  completeRoom(roomId, payload);
 }
 
 function detectGameWinner(report: AgentReport) {
@@ -1848,17 +1978,202 @@ function detectGameWinner(report: AgentReport) {
   return null;
 }
 
+function completeRoom(roomId: string, payload: Record<string, unknown> = {}) {
+  const room = getRoomState(roomId);
+  const now = Date.now();
+
+  if (!room.completedAt) {
+    room.completedAt = now;
+    room.expiresAt = now + COMPLETED_ROOM_TTL_MS;
+  } else if (!room.expiresAt) {
+    room.expiresAt = room.completedAt + COMPLETED_ROOM_TTL_MS;
+  }
+
+  const expiresAt = room.expiresAt ?? now + COMPLETED_ROOM_TTL_MS;
+  room.expiresAt = expiresAt;
+  const closeDeadline = getRoomCloseDeadline(room, now);
+  const closesAt = closeDeadline?.closesAt ?? expiresAt;
+  const eventPayload = {
+    ...payload,
+    completedAt: room.completedAt,
+    expiresAt,
+    closesAt,
+    ttlMs: Math.max(0, closesAt - now),
+    room: serializeRoom(roomId)
+  };
+  const event = emitRoomEvent(roomId, "game-over", eventPayload);
+  return {
+    event,
+    completedAt: room.completedAt,
+    expiresAt
+  };
+}
+
+function startRoomCleanupTimer() {
+  if (roomCleanupTimer) return;
+  roomCleanupTimer = setInterval(() => cleanupRooms(), ROOM_CLEANUP_INTERVAL_MS);
+}
+
+function cleanupRooms(now = Date.now()) {
+  cleanupClosedRoomRecords(now);
+
+  for (const room of Array.from(rooms.values())) {
+    if (room.id === DEFAULT_ROOM_ID) continue;
+
+    maybeEmitRoomLifecycleWarnings(room, now);
+    const closeReason = getRoomCloseReason(room, now);
+    if (closeReason) closeRoom(room, closeReason);
+  }
+}
+
+function getRoomCloseReason(room: RoomState, now = Date.now()) {
+  const deadline = getRoomCloseDeadline(room, now);
+  if (!deadline || deadline.closesAt > now) return null;
+  return deadline.reason;
+}
+
+function getRoomCloseDeadline(room: RoomState, now = Date.now()) {
+  if (room.id === DEFAULT_ROOM_ID) return null;
+
+  const deadlines: Array<{ closesAt: number; reason: string; kind: "completed" | RoomWarningKind }> = [];
+
+  if (room.completedAt && room.expiresAt) {
+    deadlines.push({ closesAt: room.expiresAt, reason: "Completed lobby expired.", kind: "completed" });
+  } else {
+    deadlines.push({
+      closesAt: getIdleRoomExpiresAt(room),
+      reason: "Lobby inactive for too long.",
+      kind: "idle"
+    });
+  }
+
+  deadlines.push({
+    closesAt: getMaxRoomAgeExpiresAt(room),
+    reason: "Lobby reached the maximum lifetime.",
+    kind: "max-age"
+  });
+
+  return deadlines.sort((left, right) => left.closesAt - right.closesAt)[0] ?? null;
+}
+
+function getIdleRoomExpiresAt(room: RoomState) {
+  return room.lastActivityAt + IDLE_ROOM_TTL_MS;
+}
+
+function getMaxRoomAgeExpiresAt(room: RoomState) {
+  return room.createdAt + MAX_ROOM_AGE_MS;
+}
+
+function getRoomWarnings(room: RoomState, now = Date.now()): RoomWarning[] {
+  if (room.id === DEFAULT_ROOM_ID) return [];
+  if (room.completedAt) return [];
+
+  const warnings: RoomWarning[] = [];
+  const idleClosesAt = getIdleRoomExpiresAt(room);
+  if (now >= idleClosesAt - IDLE_ROOM_WARNING_MS && now < idleClosesAt) {
+    warnings.push(createRoomWarning("idle", idleClosesAt, now));
+  }
+
+  const maxAgeClosesAt = getMaxRoomAgeExpiresAt(room);
+  if (now >= maxAgeClosesAt - MAX_ROOM_AGE_WARNING_MS && now < maxAgeClosesAt) {
+    warnings.push(createRoomWarning("max-age", maxAgeClosesAt, now));
+  }
+
+  return warnings;
+}
+
+function createRoomWarning(kind: RoomWarningKind, closesAt: number, now = Date.now()): RoomWarning {
+  if (kind === "idle") {
+    return {
+      kind,
+      message: "Lobby inactive. Take an action to keep it open.",
+      action: "Take any action or press Keep open.",
+      issuedAt: now,
+      closesAt,
+      ttlMs: Math.max(0, closesAt - now)
+    };
+  }
+
+  return {
+    kind,
+    message: "Lobby has been open for almost 24 hours and will close soon.",
+    action: null,
+    issuedAt: now,
+    closesAt,
+    ttlMs: Math.max(0, closesAt - now)
+  };
+}
+
+function maybeEmitRoomLifecycleWarnings(room: RoomState, now = Date.now()) {
+  for (const warning of getRoomWarnings(room, now)) {
+    if (warning.kind === "idle") {
+      if (room.idleWarningSentAt && room.idleWarningSentAt >= room.lastActivityAt) continue;
+      room.idleWarningSentAt = now;
+    } else if (warning.kind === "max-age") {
+      if (room.maxAgeWarningSentAt) continue;
+      room.maxAgeWarningSentAt = now;
+    }
+
+    emitRoomEvent(room.id, "room-warning", { warning, room: serializeRoom(room.id) });
+  }
+}
+
+function cleanupClosedRoomRecords(now = Date.now()) {
+  for (const [roomId, closedRoom] of closedRooms) {
+    if (now - closedRoom.closedAt > CLOSED_ROOM_TOMBSTONE_TTL_MS) {
+      closedRooms.delete(roomId);
+    }
+  }
+}
+
+function closeRoom(room: RoomState, reason: string) {
+  const closedAt = Date.now();
+  const nextRoom = defaultLobby?.roomId === room.id ? rotateDefaultLobby(DEFAULT_ATTRACT_TITLE) : null;
+  const closedRoom: ClosedRoomRecord = {
+    roomId: room.id,
+    completedAt: room.completedAt,
+    expiresAt: room.expiresAt,
+    closedAt,
+    reason
+  };
+
+  emitRoomEvent(room.id, "room-closed", { ...closedRoom, nextRoomId: nextRoom?.id ?? null });
+  for (const client of Array.from(room.sseClients)) {
+    try {
+      client.end();
+    } catch {
+      // Closing stale event streams is best effort.
+    }
+  }
+  room.sseClients.clear();
+  rooms.delete(room.id);
+  closedRooms.set(room.id, closedRoom);
+}
+
 function serializeRoom(roomId: string) {
   const room = getRoomState(roomId);
+  const now = Date.now();
   const participants = getActiveRoomParticipants(room);
   const playerParticipants = participants.filter((participant) => participant.role === "player");
   const observerParticipants = participants.filter((participant) => participant.role === "observer");
+  const closeDeadline = getRoomCloseDeadline(room, now);
 
   return {
     id: room.id,
     title: room.title,
     createdAt: room.createdAt,
     updatedAt: room.updatedAt,
+    lastActivityAt: room.lastActivityAt,
+    gameStartedAt: room.gameStartedAt,
+    completedAt: room.completedAt,
+    expiresAt: room.expiresAt,
+    idleExpiresAt: room.id === DEFAULT_ROOM_ID || room.completedAt ? null : getIdleRoomExpiresAt(room),
+    maxAgeExpiresAt: room.id === DEFAULT_ROOM_ID ? null : getMaxRoomAgeExpiresAt(room),
+    closesAt: closeDeadline?.closesAt ?? null,
+    closeReason: closeDeadline?.reason ?? null,
+    warnings: getRoomWarnings(room, now),
+    ttlMs: closeDeadline ? Math.max(0, closeDeadline.closesAt - now) : null,
+    elapsedGameMs: elapsedGameMs(room),
     tinyState: room.tinyState,
     roomUrl: `http://127.0.0.1:${BRIDGE_PORT}/rooms/${room.id}`,
     watchUrl: `http://127.0.0.1:${BRIDGE_PORT}/watch/${room.id}`,
@@ -1886,7 +2201,8 @@ function serializeRoom(roomId: string) {
           }
         ];
       })
-    )
+    ),
+    events: room.events
   };
 }
 
@@ -1905,6 +2221,7 @@ function joinRoomParticipant(roomId: string, value: unknown) {
 
   if (existing?.role === "player" && existing.player && !occupied.has(existing.player)) {
     existing.lastSeenAt = now;
+    markRoomActivity(roomId, now);
     touchRoom(roomId);
     return existing;
   }
@@ -1919,6 +2236,7 @@ function joinRoomParticipant(roomId: string, value: unknown) {
   };
 
   room.participants.set(sessionId, participant);
+  markRoomActivity(roomId, now);
   touchRoom(roomId);
   emitRoomEvent(roomId, "room", { room: serializeRoom(roomId), participant: serializeRoomParticipant(participant, false) });
   return participant;
@@ -1943,6 +2261,7 @@ function leaveRoomParticipant(roomId: string, value: unknown) {
   const sessionId = normalizeRoomSessionId(value);
   if (!room.participants.delete(sessionId)) return;
 
+  markRoomActivity(roomId);
   touchRoom(roomId);
   emitRoomEvent(roomId, "room", { room: serializeRoom(roomId) });
 }
@@ -1992,8 +2311,7 @@ function getRoomExport(roomId: string) {
           }
         ];
       })
-    ),
-    events: room.events
+    )
   };
 }
 
@@ -2017,6 +2335,11 @@ function importRoomExport(roomId: string, value: unknown) {
       if (typeof importedMeta?.ready === "boolean") state.ready = importedMeta.ready;
       if (isRecord(importedPlayer?.report)) state.latestReport = normalizeReport(importedPlayer.report as AgentReport);
     }
+    updateGameClock(roomId);
+  }
+
+  if (typeof importedRoom?.gameStartedAt === "number" && allPlayersReady(roomId)) {
+    room.gameStartedAt = importedRoom.gameStartedAt;
   }
 
   touchRoom(roomId);
@@ -2062,6 +2385,36 @@ function getPlayerModes(roomId: string) {
 
 function allPlayersReady(roomId: string) {
   return PLAYER_IDS.every((playerId) => getPlayerState(roomId, playerId).ready);
+}
+
+function setPlayerReadyState(roomId: string, playerId: PlayerId, ready: boolean) {
+  getPlayerState(roomId, playerId).ready = ready;
+  updateGameClock(roomId);
+}
+
+function setAllPlayersReadyState(roomId: string, ready: boolean) {
+  for (const playerId of PLAYER_IDS) {
+    getPlayerState(roomId, playerId).ready = ready;
+  }
+  updateGameClock(roomId);
+}
+
+function updateGameClock(roomId: string) {
+  const room = getRoomState(roomId);
+  const nowAllReady = allPlayersReady(roomId);
+  const previousStartedAt = room.gameStartedAt;
+
+  if (nowAllReady && !room.gameStartedAt) {
+    room.gameStartedAt = Date.now();
+  } else if (!nowAllReady && room.gameStartedAt) {
+    room.gameStartedAt = null;
+  }
+
+  return room.gameStartedAt !== previousStartedAt;
+}
+
+function elapsedGameMs(room: RoomState) {
+  return room.gameStartedAt ? Math.max(0, Date.now() - room.gameStartedAt) : 0;
 }
 
 function readyGateMessage(roomId: string, playerId: PlayerId) {
@@ -2332,6 +2685,7 @@ function queueCommand(roomId: string, playerId: PlayerId, command: AgentCommand)
 
   assertCommandRateLimit(roomId, playerId, command.type);
   state.pendingCommand = command;
+  markRoomActivity(roomId);
 
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -2367,6 +2721,10 @@ function normalizeReport(report: AgentReport): AgentReport {
 
   return {
     at: Date.now(),
+    lastUserActivityAt:
+      typeof report.lastUserActivityAt === "number" && Number.isFinite(report.lastUserActivityAt)
+        ? report.lastUserActivityAt
+        : undefined,
     url: String(report.url ?? ""),
     title: String(report.title ?? ""),
     buttons: Array.isArray(report.buttons) ? report.buttons : [],
@@ -2680,7 +3038,7 @@ function normalizeRoomSessionId(value: unknown) {
 function createShortRoomId() {
   for (let attempt = 0; attempt < 20; attempt += 1) {
     const roomId = randomUUID().replace(/-/g, "").slice(0, ROOM_ID_LENGTH);
-    if (!rooms.has(roomId)) return roomId;
+    if (!rooms.has(roomId) && !closedRooms.has(roomId)) return roomId;
   }
   return randomUUID().replace(/-/g, "").slice(0, 12);
 }
@@ -2959,6 +3317,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   let reportAgainAfterInFlight = false;
   let pollInFlight = false;
   let lastReportAt = 0;
+  let lastUserActivityAt = 0;
   let lastBridgeHeuristicTickAt = 0;
   let suppressClickReportUntil = 0;
   let heuristicTickStream = null;
@@ -3274,6 +3633,12 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     flashBlocked(target);
   };
 
+  const noteUserActivity = (event) => {
+    if (!event.isTrusted) return;
+    lastUserActivityAt = Date.now();
+    scheduleReport(80);
+  };
+
   const blockShieldInput = (event) => {
     if (!userInputLocked() || !event.isTrusted) return;
     event.preventDefault();
@@ -3480,6 +3845,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           at: Date.now(),
+          lastUserActivityAt: lastUserActivityAt || undefined,
           roomId: ROOM_ID,
           playerId: PLAYER_ID,
           mode: playerMode,
@@ -3635,6 +4001,9 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     scheduleReport(80);
   }, true);
   window.addEventListener("change", () => scheduleReport(80), true);
+  for (const eventName of ["pointerdown", "click", "keydown", "change", "input"]) {
+    window.addEventListener(eventName, noteUserActivity, true);
+  }
   for (const eventName of [
     "pointerdown",
     "mousedown",

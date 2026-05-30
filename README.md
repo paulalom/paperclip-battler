@@ -60,10 +60,12 @@ Room-aware bridge endpoints:
 - `POST /rooms/:id/participants`
 - `POST /rooms/:id/participants/heartbeat`
 - `POST /rooms/:id/participants/leave`
+- `POST /rooms/:id/activity` to keep an unfinished room active
 - `GET /watch/:id`
 - `GET /rooms/:id/events` for SSE snapshot/room events
 - `GET /rooms/:id/export`
 - `POST /rooms/:id/import`
+- `POST /rooms/:id/complete` to mark a room finished; completed rooms close after 5 minutes by default
 - `GET /rooms/:id/snapshot`
 - `POST /rooms/:id/snapshot` with optional `{ "tinyState": { ... } }`
 - `GET /rooms/:id/save`
@@ -71,7 +73,7 @@ Room-aware bridge endpoints:
 
 Existing bridge endpoints also accept `room` in the query string or JSON body, for example `GET /health?room=abc123` and `POST /players/ready` with `{ "room": "abc123", "player": "right", "ready": true, "force": true }`. Player frames load through room-scoped URLs such as `/rooms/abc123/players/left/index2.html`, so browser storage is partitioned by room and player.
 
-The bridge launches a local headless Chrome, Edge, or Chromium process to own the default attract lobby. Set `PAPERCLIP_DEFAULT_ATTRACT=0` to disable it, `PAPERCLIP_ATTRACT_BROWSER_PATH` to point at a browser executable, or `PAPERCLIP_DEFAULT_ATTRACT_RESTART_DELAY_MS` to change the winner overlay delay before default viewers follow the next lobby.
+The bridge launches a local headless Chrome, Edge, or Chromium process to own the default attract lobby. Set `PAPERCLIP_DEFAULT_ATTRACT=0` to disable it, `PAPERCLIP_ATTRACT_BROWSER_PATH` to point at a browser executable, or `PAPERCLIP_DEFAULT_ATTRACT_RESTART_DELAY_MS` to change the winner overlay delay before default viewers follow the next lobby. Completed rooms stay available for 5 minutes before closing; set `PAPERCLIP_COMPLETED_ROOM_TTL_MS` to change that window. Unfinished rooms close after 1 hour without user activity and after 24 hours regardless; set `PAPERCLIP_IDLE_ROOM_TTL_MS`, `PAPERCLIP_IDLE_ROOM_WARNING_MS`, `PAPERCLIP_MAX_ROOM_AGE_MS`, or `PAPERCLIP_MAX_ROOM_AGE_WARNING_MS` to tune those limits.
 
 Available MCP tools:
 

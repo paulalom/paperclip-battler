@@ -13,6 +13,7 @@ import {
   RotateCcw,
   Server,
   SplitSquareVertical,
+  Timer,
   Unlock,
   Upload,
   User,
@@ -114,11 +115,31 @@ type BridgeRoomParticipant = {
   ttlMs: number;
 };
 
+type BridgeRoomWarning = {
+  kind: "idle" | "max-age";
+  message: string;
+  action: string | null;
+  issuedAt: number;
+  closesAt: number;
+  ttlMs: number;
+};
+
 type BridgeRoom = {
   id: string;
   title: string;
   createdAt: number;
   updatedAt: number;
+  lastActivityAt: number;
+  gameStartedAt: number | null;
+  completedAt: number | null;
+  expiresAt: number | null;
+  idleExpiresAt: number | null;
+  maxAgeExpiresAt: number | null;
+  closesAt: number | null;
+  closeReason: string | null;
+  warnings: BridgeRoomWarning[];
+  ttlMs: number | null;
+  elapsedGameMs: number;
   tinyState: Record<string, unknown>;
   roomUrl: string;
   watchUrl: string;
@@ -138,6 +159,8 @@ type BridgeHealth = {
   roomId?: string;
   roomUrl?: string;
   watchUrl?: string;
+  gameStartedAt?: number | null;
+  elapsedGameMs?: number;
   bridgeUrl: string;
   agentUrl: string;
   playerUrls?: Record<PlayerId, string>;
@@ -155,6 +178,7 @@ type AppRoute = {
   view: RoomView;
   embedded: boolean;
   defaultLobby: boolean;
+  followDefaultLobby: boolean;
 };
 type RoomEvent = {
   id: number;
@@ -168,6 +192,7 @@ type WinnerOverlay = {
   message: string;
   nextRoomId: string | null;
   restartDelayMs: number;
+  closesAt: number | null;
 };
 
 function notifyEmbeddedHost(roomId: string, view: RoomView) {
@@ -194,17 +219,24 @@ function parseGameOverPayload(event: MessageEvent): WinnerOverlay | null {
     const winner = normalizeWinnerPlayer(payload.winner);
     if (!winner) return null;
 
+    const room = isRecordValue(payload.room) ? payload.room : null;
     const nextRoomId = typeof payload.nextRoomId === "string" ? normalizeRoomId(payload.nextRoomId) : null;
     const restartDelayMs =
       typeof payload.restartDelayMs === "number" && Number.isFinite(payload.restartDelayMs)
         ? Math.max(250, payload.restartDelayMs)
         : 1000;
+    const closesAt =
+      readTimestamp(payload.closesAt) ??
+      readTimestamp(payload.expiresAt) ??
+      readTimestamp(room?.expiresAt) ??
+      readTimestampFromTtl(payload.ttlMs);
 
     return {
       winner,
       message: typeof payload.message === "string" ? payload.message : `${PLAYER_LABELS[winner]} wins`,
       nextRoomId,
-      restartDelayMs
+      restartDelayMs,
+      closesAt
     };
   } catch {
     return null;
@@ -219,6 +251,27 @@ function normalizeWinnerPlayer(value: unknown): PlayerId | null {
   return value === "left" || value === "right" ? value : null;
 }
 
+function readTimestamp(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function readTimestampFromTtl(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? Date.now() + Math.max(0, value) : null;
+}
+
+function shouldResumeDefaultLobby(health: BridgeHealth) {
+  const expiresAt = health.room?.expiresAt;
+  if (typeof expiresAt === "number" && expiresAt <= Date.now()) return true;
+
+  return !PLAYER_IDS.every((playerId) => {
+    const player = health.players?.[playerId];
+    const slot = health.room?.slots?.[playerId];
+    const mode = player?.mode ?? slot?.mode;
+    const ready = player?.ready ?? slot?.ready;
+    return mode === "heuristic" && ready;
+  });
+}
+
 export function App() {
   const initialRoute = readRoomRoute();
   const [bridgeUrl, setBridgeUrl] = useState(() => readInitialBridgeUrl());
@@ -228,17 +281,19 @@ export function App() {
   const [roomView, setRoomView] = useState<RoomView>(() => initialRoute.view);
   const [embedded, setEmbedded] = useState(() => initialRoute.embedded);
   const [useDefaultLobby, setUseDefaultLobby] = useState(() => initialRoute.defaultLobby);
-  const [followDefaultLobby, setFollowDefaultLobby] = useState(() => initialRoute.defaultLobby);
+  const [followDefaultLobby, setFollowDefaultLobby] = useState(() => initialRoute.followDefaultLobby);
   const [roomNotice, setRoomNotice] = useState("");
   const [playerModes, setPlayerModes] = useState<Record<PlayerId, PlayerMode>>(readPlayerModes);
   const [health, setHealth] = useState<BridgeHealth | null>(null);
   const [status, setStatus] = useState<BridgeStatus>("checking");
   const [roomParticipant, setRoomParticipant] = useState<BridgeRoomParticipant | null>(null);
   const [winnerOverlay, setWinnerOverlay] = useState<WinnerOverlay | null>(null);
+  const [timerNow, setTimerNow] = useState(() => Date.now());
   const importInputRef = useRef<HTMLInputElement>(null);
   const leftFrame = useRef<HTMLIFrameElement>(null);
   const rightFrame = useRef<HTMLIFrameElement>(null);
   const roomSessionIdRef = useRef(readRoomSessionId());
+  const lastActivityPostRef = useRef(0);
 
   const frameRefs: Record<PlayerId, React.RefObject<HTMLIFrameElement>> = {
     left: leftFrame,
@@ -248,6 +303,18 @@ export function App() {
   const playUrl = `${window.location.origin}/rooms/${encodeURIComponent(roomId)}`;
   const watchUrl = `${window.location.origin}/watch/${encodeURIComponent(roomId)}`;
   const usesRoomSlots = embedded && roomView === "play" && !useDefaultLobby;
+  const gameStartedAt = health?.room?.gameStartedAt ?? health?.gameStartedAt ?? null;
+  const elapsedGameMs = gameStartedAt ? timerNow - gameStartedAt : health?.room?.elapsedGameMs ?? health?.elapsedGameMs ?? 0;
+  const elapsedGameTime = formatElapsedGameTime(elapsedGameMs);
+  const gameTimeRunning = Boolean(gameStartedAt);
+  const gameTimeTitle = gameStartedAt
+    ? `Started ${new Date(gameStartedAt).toLocaleTimeString()}`
+    : "Timer starts when both players are ready";
+  const lobbyCloseMessage = winnerOverlay?.closesAt
+    ? `Lobby will close in ${formatCountdown(winnerOverlay.closesAt - timerNow)}`
+    : null;
+  const roomWarnings = health?.room?.warnings ?? [];
+  const roomWarningClosesAt = roomWarnings[0]?.closesAt ?? null;
 
   useEffect(() => {
     if (!embedded || useDefaultLobby || !roomId) return;
@@ -269,7 +336,7 @@ export function App() {
       setRoomView(nextRoute.view);
       setEmbedded(nextRoute.embedded);
       setUseDefaultLobby(nextRoute.defaultLobby);
-      setFollowDefaultLobby(nextRoute.defaultLobby);
+      setFollowDefaultLobby(nextRoute.followDefaultLobby);
       setWinnerOverlay(null);
     };
     window.addEventListener("popstate", onPopState);
@@ -281,34 +348,83 @@ export function App() {
   }, [playerModes]);
 
   useEffect(() => {
+    setTimerNow(Date.now());
+    if (!gameStartedAt && !winnerOverlay?.closesAt && !roomWarningClosesAt) return undefined;
+
+    const timer = window.setInterval(() => setTimerNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [gameStartedAt, roomWarningClosesAt, winnerOverlay?.closesAt]);
+
+  async function postRoomActivity(options: { force?: boolean; notice?: boolean } = {}) {
+    if (!roomId || useDefaultLobby) return;
+
+    const now = Date.now();
+    if (!options.force && now - lastActivityPostRef.current < 15_000) return;
+    lastActivityPostRef.current = now;
+
+    try {
+      const response = await fetch(`${trimmedBridgeUrl}/rooms/${encodeURIComponent(roomId)}/activity`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ at: now })
+      });
+      if (!response.ok) throw new Error(`Bridge returned ${response.status}`);
+      const payload = (await response.json()) as { room?: BridgeRoom };
+      if (payload.room?.id === roomId) {
+        setHealth((current) => (current ? { ...current, room: payload.room } : current));
+      }
+      if (options.notice) setRoomNotice("Lobby kept open");
+    } catch {
+      setStatus("offline");
+    }
+  }
+
+  useEffect(() => {
+    if (!roomId || useDefaultLobby) return undefined;
+
+    const recordActivity = () => {
+      void postRoomActivity();
+    };
+    window.addEventListener("pointerdown", recordActivity, true);
+    window.addEventListener("keydown", recordActivity, true);
+    window.addEventListener("change", recordActivity, true);
+    return () => {
+      window.removeEventListener("pointerdown", recordActivity, true);
+      window.removeEventListener("keydown", recordActivity, true);
+      window.removeEventListener("change", recordActivity, true);
+    };
+  }, [roomId, trimmedBridgeUrl, useDefaultLobby]);
+
+  async function resolveDefaultLobbyRoute(options: { cancelled?: () => boolean; notice?: string } = {}) {
+    setStatus("checking");
+    const response = await fetch(`${trimmedBridgeUrl}/lobbies/default`, { cache: "no-store" });
+    if (!response.ok) throw new Error(`Bridge returned ${response.status}`);
+    const payload = (await response.json()) as { room?: BridgeRoom };
+    if (!payload.room?.id) throw new Error("Bridge did not return a lobby room.");
+    if (options.cancelled?.()) return false;
+
+    setRoomId(payload.room.id);
+    setRoomView(roomView);
+    setUseDefaultLobby(false);
+    setFollowDefaultLobby(true);
+    setRoomNotice(options.notice ?? `Lobby ${payload.room.id} ready`);
+    window.history.replaceState({}, "", roomRoutePath(payload.room.id, roomView, embedded, { followDefaultLobby: true }));
+    return true;
+  }
+
+  useEffect(() => {
     if (!useDefaultLobby) return undefined;
 
     let cancelled = false;
 
-    async function resolveDefaultLobby() {
-      setStatus("checking");
-      try {
-        const response = await fetch(`${trimmedBridgeUrl}/lobbies/default`, { cache: "no-store" });
-        if (!response.ok) throw new Error(`Bridge returned ${response.status}`);
-        const payload = (await response.json()) as { room?: BridgeRoom };
-        if (!payload.room?.id) throw new Error("Bridge did not return a lobby room.");
-        if (cancelled) return;
-        setRoomId(payload.room.id);
-        setRoomView(roomView);
+    resolveDefaultLobbyRoute({ cancelled: () => cancelled }).catch(() => {
+      if (!cancelled) {
+        setStatus("offline");
+        setRoomNotice("Default lobby offline");
         setUseDefaultLobby(false);
-        setFollowDefaultLobby(true);
-        setRoomNotice(`Lobby ${payload.room.id} ready`);
-        window.history.replaceState({}, "", roomRoutePath(payload.room.id, roomView, embedded));
-      } catch {
-        if (!cancelled) {
-          setStatus("offline");
-          setRoomNotice("Default lobby offline");
-          setUseDefaultLobby(false);
-        }
       }
-    }
+    });
 
-    resolveDefaultLobby();
     return () => {
       cancelled = true;
     };
@@ -347,8 +463,16 @@ export function App() {
     async function pollHealth() {
       try {
         const response = await fetch(`${trimmedBridgeUrl}/health?room=${encodeURIComponent(roomId)}`, { cache: "no-store" });
+        if (response.status === 410 && followDefaultLobby) {
+          await resolveDefaultLobbyRoute({ cancelled: () => cancelled, notice: "Default lobby resumed" });
+          return;
+        }
         if (!response.ok) throw new Error(`Bridge returned ${response.status}`);
         let nextHealth = (await response.json()) as BridgeHealth;
+        if (followDefaultLobby && shouldResumeDefaultLobby(nextHealth)) {
+          await resolveDefaultLobbyRoute({ cancelled: () => cancelled, notice: "Default lobby resumed" });
+          return;
+        }
         const managedPlayerIds =
           roomView === "watch"
             ? []
@@ -399,7 +523,18 @@ export function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [playerModes, roomId, roomParticipant?.player, roomParticipant?.role, roomView, trimmedBridgeUrl, useDefaultLobby, usesRoomSlots]);
+  }, [
+    embedded,
+    followDefaultLobby,
+    playerModes,
+    roomId,
+    roomParticipant?.player,
+    roomParticipant?.role,
+    roomView,
+    trimmedBridgeUrl,
+    useDefaultLobby,
+    usesRoomSlots
+  ]);
 
   useEffect(() => {
     if (!roomId || useDefaultLobby) return undefined;
@@ -420,12 +555,27 @@ export function App() {
         setRoomId(nextRoomId);
         setRoomView(roomView);
         setWinnerOverlay(null);
-        window.history.replaceState({}, "", roomRoutePath(nextRoomId, roomView, embedded));
+        window.history.replaceState({}, "", roomRoutePath(nextRoomId, roomView, embedded, { followDefaultLobby: true }));
       }, payload.restartDelayMs);
+    };
+    const handleRoomClosed = () => {
+      if (!followDefaultLobby) return;
+      void resolveDefaultLobbyRoute({ notice: "Default lobby resumed" }).catch(() => setStatus("offline"));
+    };
+    const handleRoomWarning = (event: MessageEvent) => {
+      try {
+        const roomEvent = JSON.parse(event.data) as RoomEvent;
+        const room = isRecordValue(roomEvent.payload) && isRecordValue(roomEvent.payload.room) ? (roomEvent.payload.room as BridgeRoom) : null;
+        if (room?.id === roomId) setHealth((current) => (current ? { ...current, room } : current));
+      } catch {
+        // The next health poll will refresh room lifecycle warnings.
+      }
     };
     events.addEventListener("snapshot", markConnected);
     events.addEventListener("room", markConnected);
     events.addEventListener("game-over", handleGameOver);
+    events.addEventListener("room-warning", handleRoomWarning);
+    events.addEventListener("room-closed", handleRoomClosed);
     events.onerror = () => events.close();
     return () => {
       if (restartTimer !== null) window.clearTimeout(restartTimer);
@@ -547,7 +697,7 @@ export function App() {
         body: JSON.stringify({ room: roomId, player: playerId, ready, force: true })
       });
       if (!response.ok) throw new Error(`Bridge returned ${response.status}`);
-      const payload = (await response.json()) as Pick<BridgeHealth, "allPlayersReady" | "players">;
+      const payload = (await response.json()) as Pick<BridgeHealth, "allPlayersReady" | "players" | "room">;
       setHealth((current) => (current ? { ...current, ...payload } : current));
     } catch {
       setStatus("offline");
@@ -753,66 +903,84 @@ export function App() {
         </header>
       ) : null}
 
-      {useDefaultLobby ? (
-        <LobbyStatusView message={status === "offline" ? "Default lobby offline" : "Finding lobby"} />
-      ) : waitingForSlot ? (
-        <LobbyStatusView message={status === "offline" ? "Room bridge offline" : "Joining lobby"} />
-      ) : roomView === "watch" || observerMode ? (
-        <WatchView
-          health={health}
-          status={status}
-          playerModes={playerModes}
-          sourceForPlayer={spectatorUrl}
-          winnerOverlay={winnerOverlay}
-        />
-      ) : assignedPlayer ? (
-        <section className="split-view">
-          {PLAYER_IDS.map((playerId) => {
-            const isAssignedPlayer = playerId === assignedPlayer;
-            const noop = () => undefined;
-            return (
+      <section className="room-body">
+        {roomWarnings.length ? (
+          <RoomWarningBanner warnings={roomWarnings} now={timerNow} onKeepOpen={() => postRoomActivity({ force: true, notice: true })} />
+        ) : null}
+
+        {useDefaultLobby ? (
+          <LobbyStatusView message={status === "offline" ? "Default lobby offline" : "Finding lobby"} />
+        ) : waitingForSlot ? (
+          <LobbyStatusView message={status === "offline" ? "Room bridge offline" : "Joining lobby"} />
+        ) : roomView === "watch" || observerMode ? (
+          <WatchView
+            health={health}
+            status={status}
+            playerModes={playerModes}
+            sourceForPlayer={spectatorUrl}
+            winnerOverlay={winnerOverlay}
+            lobbyCloseMessage={lobbyCloseMessage}
+            elapsedGameTime={elapsedGameTime}
+            gameTimeRunning={gameTimeRunning}
+            gameTimeTitle={gameTimeTitle}
+          />
+        ) : assignedPlayer ? (
+          <section className="split-view">
+            {PLAYER_IDS.map((playerId) => {
+              const isAssignedPlayer = playerId === assignedPlayer;
+              const noop = () => undefined;
+              return (
+                <OriginalPane
+                  key={playerId}
+                  title={isAssignedPlayer ? `${PLAYER_LABELS[playerId]} (you)` : PLAYER_LABELS[playerId]}
+                  source={isAssignedPlayer ? playerUrl(playerId) : spectatorUrl(playerId)}
+                  mode={isAssignedPlayer ? playerModes[playerId] : health?.players?.[playerId]?.mode ?? playerModes[playerId]}
+                  health={health?.players?.[playerId]}
+                  frameRef={isAssignedPlayer ? frameRefs[playerId] : undefined}
+                  disabled={status === "offline"}
+                  allPlayersReady={Boolean(health?.allPlayersReady)}
+                  elapsedGameTime={elapsedGameTime}
+                  gameTimeRunning={gameTimeRunning}
+                  gameTimeTitle={gameTimeTitle}
+                  readOnly={!isAssignedPlayer}
+                  onModeChange={isAssignedPlayer ? (mode) => setPlayerMode(playerId, mode) : noop}
+                  onReadyChange={isAssignedPlayer ? (ready) => setPlayerReady(playerId, ready) : noop}
+                  onReload={isAssignedPlayer ? () => reloadPlayer(playerId) : noop}
+                  onReset={isAssignedPlayer ? () => resetPlayer(playerId) : noop}
+                  onReleaseClaim={isAssignedPlayer ? () => releasePlayerClaim(playerId) : noop}
+                  winnerMessage={winnerOverlay?.winner === playerId ? winnerOverlay.message : null}
+                  winnerCloseMessage={winnerOverlay?.winner === playerId ? lobbyCloseMessage : null}
+                />
+              );
+            })}
+          </section>
+        ) : (
+          <section className="split-view">
+            {PLAYER_IDS.map((playerId) => (
               <OriginalPane
                 key={playerId}
-                title={isAssignedPlayer ? `${PLAYER_LABELS[playerId]} (you)` : PLAYER_LABELS[playerId]}
-                source={isAssignedPlayer ? playerUrl(playerId) : spectatorUrl(playerId)}
-                mode={isAssignedPlayer ? playerModes[playerId] : health?.players?.[playerId]?.mode ?? playerModes[playerId]}
+                title={PLAYER_LABELS[playerId]}
+                source={playerUrl(playerId)}
+                mode={playerModes[playerId]}
                 health={health?.players?.[playerId]}
-                frameRef={isAssignedPlayer ? frameRefs[playerId] : undefined}
+                frameRef={frameRefs[playerId]}
                 disabled={status === "offline"}
                 allPlayersReady={Boolean(health?.allPlayersReady)}
-                readOnly={!isAssignedPlayer}
-                onModeChange={isAssignedPlayer ? (mode) => setPlayerMode(playerId, mode) : noop}
-                onReadyChange={isAssignedPlayer ? (ready) => setPlayerReady(playerId, ready) : noop}
-                onReload={isAssignedPlayer ? () => reloadPlayer(playerId) : noop}
-                onReset={isAssignedPlayer ? () => resetPlayer(playerId) : noop}
-                onReleaseClaim={isAssignedPlayer ? () => releasePlayerClaim(playerId) : noop}
+                elapsedGameTime={elapsedGameTime}
+                gameTimeRunning={gameTimeRunning}
+                gameTimeTitle={gameTimeTitle}
+                onModeChange={(mode) => setPlayerMode(playerId, mode)}
+                onReadyChange={(ready) => setPlayerReady(playerId, ready)}
+                onReload={() => reloadPlayer(playerId)}
+                onReset={() => resetPlayer(playerId)}
+                onReleaseClaim={() => releasePlayerClaim(playerId)}
                 winnerMessage={winnerOverlay?.winner === playerId ? winnerOverlay.message : null}
+                winnerCloseMessage={winnerOverlay?.winner === playerId ? lobbyCloseMessage : null}
               />
-            );
-          })}
-        </section>
-      ) : (
-        <section className="split-view">
-          {PLAYER_IDS.map((playerId) => (
-            <OriginalPane
-              key={playerId}
-              title={PLAYER_LABELS[playerId]}
-              source={playerUrl(playerId)}
-              mode={playerModes[playerId]}
-              health={health?.players?.[playerId]}
-              frameRef={frameRefs[playerId]}
-              disabled={status === "offline"}
-              allPlayersReady={Boolean(health?.allPlayersReady)}
-              onModeChange={(mode) => setPlayerMode(playerId, mode)}
-              onReadyChange={(ready) => setPlayerReady(playerId, ready)}
-              onReload={() => reloadPlayer(playerId)}
-              onReset={() => resetPlayer(playerId)}
-              onReleaseClaim={() => releasePlayerClaim(playerId)}
-              winnerMessage={winnerOverlay?.winner === playerId ? winnerOverlay.message : null}
-            />
-          ))}
-        </section>
-      )}
+            ))}
+          </section>
+        )}
+      </section>
     </main>
   );
 }
@@ -822,13 +990,21 @@ function WatchView({
   status,
   playerModes,
   sourceForPlayer,
-  winnerOverlay
+  winnerOverlay,
+  lobbyCloseMessage,
+  elapsedGameTime,
+  gameTimeRunning,
+  gameTimeTitle
 }: {
   health: BridgeHealth | null;
   status: BridgeStatus;
   playerModes: Record<PlayerId, PlayerMode>;
   sourceForPlayer: (playerId: PlayerId) => string;
   winnerOverlay: WinnerOverlay | null;
+  lobbyCloseMessage: string | null;
+  elapsedGameTime: string;
+  gameTimeRunning: boolean;
+  gameTimeTitle: string;
 }) {
   const noop = () => undefined;
   return (
@@ -842,6 +1018,9 @@ function WatchView({
           health={health?.players?.[playerId]}
           disabled={status === "offline"}
           allPlayersReady={Boolean(health?.allPlayersReady)}
+          elapsedGameTime={elapsedGameTime}
+          gameTimeRunning={gameTimeRunning}
+          gameTimeTitle={gameTimeTitle}
           readOnly
           onModeChange={noop}
           onReadyChange={noop}
@@ -849,6 +1028,7 @@ function WatchView({
           onReset={noop}
           onReleaseClaim={noop}
           winnerMessage={winnerOverlay?.winner === playerId ? winnerOverlay.message : null}
+          winnerCloseMessage={winnerOverlay?.winner === playerId ? lobbyCloseMessage : null}
         />
       ))}
     </section>
@@ -863,6 +1043,34 @@ function LobbyStatusView({ message }: { message: string }) {
         <span>{message}</span>
       </div>
     </section>
+  );
+}
+
+function RoomWarningBanner({
+  warnings,
+  now,
+  onKeepOpen
+}: {
+  warnings: BridgeRoomWarning[];
+  now: number;
+  onKeepOpen: () => void;
+}) {
+  return (
+    <div className="room-warning-bar" role="status" aria-live="polite">
+      {warnings.map((warning) => (
+        <div key={warning.kind} className={`room-warning ${warning.kind}`}>
+          <Timer size={17} />
+          <span>
+            {warning.message} Closes in {formatCountdown(warning.closesAt - now)}.
+          </span>
+          {warning.kind === "idle" ? (
+            <button type="button" onClick={onKeepOpen}>
+              Keep open
+            </button>
+          ) : null}
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -900,12 +1108,16 @@ function OriginalPane({
   frameRef,
   disabled,
   allPlayersReady,
+  elapsedGameTime,
+  gameTimeRunning,
+  gameTimeTitle,
   onModeChange,
   onReadyChange,
   onReload,
   onReset,
   onReleaseClaim,
   winnerMessage,
+  winnerCloseMessage,
   readOnly = false
 }: {
   title: string;
@@ -915,12 +1127,16 @@ function OriginalPane({
   frameRef?: React.RefObject<HTMLIFrameElement>;
   disabled: boolean;
   allPlayersReady: boolean;
+  elapsedGameTime: string;
+  gameTimeRunning: boolean;
+  gameTimeTitle: string;
   onModeChange: (mode: PlayerMode) => void;
   onReadyChange: (ready: boolean) => void;
   onReload: () => void;
   onReset: () => void;
   onReleaseClaim: () => void;
   winnerMessage?: string | null;
+  winnerCloseMessage?: string | null;
   readOnly?: boolean;
 }) {
   const connected = Boolean(health?.connected);
@@ -948,6 +1164,10 @@ function OriginalPane({
           <span className={`ready-badge ${ready ? "ready" : "waiting"}`}>
             <Check size={14} />
             {ready ? "Ready" : "Not ready"}
+          </span>
+          <span className={`time-badge ${gameTimeRunning ? "running" : "waiting"}`} title={gameTimeTitle}>
+            <Timer size={14} />
+            {elapsedGameTime}
           </span>
           {!allPlayersReady ? (
             <span className="agent-badge gate" title="Both players must be ready first.">
@@ -1010,7 +1230,10 @@ function OriginalPane({
       <iframe ref={frameRef} src={source} title={`${title} Universal Paperclips`} />
       {winnerMessage ? (
         <div className="winner-overlay" role="status" aria-live="polite">
-          <span>{winnerMessage}</span>
+          <div className="winner-overlay-content">
+            <span>{winnerMessage}</span>
+            {winnerCloseMessage ? <small>{winnerCloseMessage}</small> : null}
+          </div>
         </div>
       ) : null}
     </article>
@@ -1054,6 +1277,7 @@ function bridgeLabel(status: BridgeStatus, health: BridgeHealth | null) {
 function readRoomRoute(): AppRoute {
   const embedded = isEmbeddedRoute();
   const queryRoom = getQueryRoomId();
+  const followDefaultLobby = shouldFollowDefaultLobby();
   const defaultLobby = shouldUseDefaultLobby(queryRoom);
   const embedMatch = window.location.pathname.match(/^\/embed(?:\/(rooms|watch))?\/([^/]+)/);
   if (embedMatch) {
@@ -1061,7 +1285,8 @@ function readRoomRoute(): AppRoute {
       roomId: normalizeRoomId(decodeURIComponent(embedMatch[2])),
       view: embedMatch[1] === "watch" ? "watch" : "play",
       embedded: true,
-      defaultLobby: false
+      defaultLobby: false,
+      followDefaultLobby
     };
   }
 
@@ -1071,7 +1296,8 @@ function readRoomRoute(): AppRoute {
       roomId: defaultLobby ? null : queryRoom,
       view: defaultLobby ? queryDefaultLobbyView() : queryView(),
       embedded,
-      defaultLobby
+      defaultLobby,
+      followDefaultLobby: defaultLobby || followDefaultLobby
     };
   }
 
@@ -1079,7 +1305,8 @@ function readRoomRoute(): AppRoute {
     roomId: normalizeRoomId(decodeURIComponent(match[2])),
     view: match[1] === "watch" ? "watch" : "play",
     embedded,
-    defaultLobby: false
+    defaultLobby: false,
+    followDefaultLobby
   };
 }
 
@@ -1098,11 +1325,16 @@ function isEmbeddedRoute() {
 
 function shouldUseDefaultLobby(queryRoom: string | null) {
   if (queryRoom) return false;
+  if (shouldFollowDefaultLobby()) return true;
+  return window.location.pathname === "/embed" || window.location.pathname === "/embed/";
+}
+
+function shouldFollowDefaultLobby() {
   const params = new URLSearchParams(window.location.search);
   const lobby = params.get("lobby")?.trim().toLowerCase();
   const defaultLobby = params.get("defaultLobby")?.trim().toLowerCase();
   if (lobby === "default" || defaultLobby === "1" || defaultLobby === "true") return true;
-  return window.location.pathname === "/embed" || window.location.pathname === "/embed/";
+  return false;
 }
 
 function getQueryRoomId() {
@@ -1120,10 +1352,14 @@ function queryDefaultLobbyView(): RoomView {
   return view === "play" ? "play" : "watch";
 }
 
-function roomRoutePath(roomId: string, view: RoomView, embedded: boolean) {
+function roomRoutePath(roomId: string, view: RoomView, embedded: boolean, options: { followDefaultLobby?: boolean } = {}) {
   const encodedRoom = encodeURIComponent(roomId);
-  if (embedded) return view === "watch" ? `/embed/watch/${encodedRoom}` : `/embed/${encodedRoom}`;
-  return `${view === "watch" ? "/watch" : "/rooms"}/${encodedRoom}`;
+  const path = embedded
+    ? view === "watch"
+      ? `/embed/watch/${encodedRoom}`
+      : `/embed/${encodedRoom}`
+    : `${view === "watch" ? "/watch" : "/rooms"}/${encodedRoom}`;
+  return options.followDefaultLobby ? `${path}?defaultLobby=1` : path;
 }
 
 function normalizeRoomId(value: string) {
@@ -1180,6 +1416,27 @@ function modeIcon(mode: PlayerMode) {
   if (mode === "heuristic") return <BrainCircuit size={14} />;
   if (mode === "both") return <Users size={14} />;
   return <User size={14} />;
+}
+
+function formatElapsedGameTime(elapsedMs: number) {
+  const totalSeconds = Math.max(0, Math.floor(elapsedMs / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (hours > 0) {
+    return `${hours}:${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`;
+  }
+
+  return `${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`;
+}
+
+function formatCountdown(ttlMs: number) {
+  const totalSeconds = Math.max(0, Math.ceil(ttlMs / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes <= 0) return `${seconds}s`;
+  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
 }
 
 function formatTtl(ttlMs: number) {
