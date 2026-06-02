@@ -27,7 +27,7 @@ const MAX_ROOM_AGE_WARNING_MS = Number(process.env.PAPERCLIP_MAX_ROOM_AGE_WARNIN
 const ROOM_CLEANUP_INTERVAL_MS = Number(process.env.PAPERCLIP_ROOM_CLEANUP_INTERVAL_MS ?? 5_000);
 const CLOSED_ROOM_TOMBSTONE_TTL_MS = Number(process.env.PAPERCLIP_CLOSED_ROOM_TOMBSTONE_TTL_MS ?? 60 * 60 * 1000);
 const ROOM_PARTICIPANT_TTL_MS = Number(process.env.PAPERCLIP_ROOM_PARTICIPANT_TTL_MS ?? 15_000);
-const SPECTATOR_SAVE_SYNC_INTERVAL_MS = 5_000;
+const SPECTATOR_SAVE_SYNC_INTERVAL_MS = 2_000;
 const BRIDGE_HEURISTIC_DECISION_TICK_MS = Number(process.env.PAPERCLIP_HEURISTIC_DECISION_TICK_MS ?? 750);
 const BRIDGE_HEURISTIC_MANUAL_CLIP_TICK_MS = Number(process.env.PAPERCLIP_HEURISTIC_MANUAL_CLIP_TICK_MS ?? 125);
 const BRIDGE_HEURISTIC_TICK_HEARTBEAT_MS = 15_000;
@@ -1563,6 +1563,7 @@ function createSpectatorControllerScript(roomId: string, playerId: PlayerId) {
   const PLAYER_ID = ${JSON.stringify(playerId)};
   const INITIAL_SAVE = ${inlineJson(initialSave)};
   const SAVE_URL = "/rooms/" + encodeURIComponent(ROOM_ID) + "/save";
+  const EVENTS_URL = "/rooms/" + encodeURIComponent(ROOM_ID) + "/events";
   const BLOCK_EVENTS = [
     "pointerdown",
     "pointerup",
@@ -1581,6 +1582,9 @@ function createSpectatorControllerScript(roomId: string, playerId: PlayerId) {
 
   let lastSaveSignature = "";
   let syncInFlight = false;
+  let syncAgainAfterInFlight = false;
+  let syncTimer = null;
+  let eventStream = null;
 
   const normalizeRecord = (value) => {
     if (!value || typeof value !== "object" || Array.isArray(value)) return {};
@@ -1720,7 +1724,14 @@ function createSpectatorControllerScript(roomId: string, playerId: PlayerId) {
   };
 
   const syncSave = async () => {
-    if (document.hidden || syncInFlight) return;
+    if (syncTimer) {
+      window.clearTimeout(syncTimer);
+      syncTimer = null;
+    }
+    if (syncInFlight) {
+      syncAgainAfterInFlight = true;
+      return;
+    }
     syncInFlight = true;
     try {
       const response = await fetch(SAVE_URL, { cache: "no-store" });
@@ -1739,7 +1750,38 @@ function createSpectatorControllerScript(roomId: string, playerId: PlayerId) {
       // The bridge may be restarting.
     } finally {
       syncInFlight = false;
+      if (syncAgainAfterInFlight) {
+        syncAgainAfterInFlight = false;
+        scheduleSyncSave(100);
+      }
     }
+  };
+
+  const scheduleSyncSave = (delayMs = 100) => {
+    if (syncTimer) return;
+    syncTimer = window.setTimeout(syncSave, delayMs);
+  };
+
+  const snapshotMatchesPlayer = (event) => {
+    try {
+      const roomEvent = JSON.parse(event.data || "{}");
+      const player = roomEvent?.payload?.player;
+      return player?.id === PLAYER_ID || player?.player === PLAYER_ID;
+    } catch {
+      return true;
+    }
+  };
+
+  const startSaveEventStream = () => {
+    if (!window.EventSource || eventStream) return;
+    eventStream = new EventSource(EVENTS_URL);
+    eventStream.addEventListener("snapshot", (event) => {
+      if (snapshotMatchesPlayer(event)) scheduleSyncSave(50);
+    });
+    eventStream.addEventListener("room", () => scheduleSyncSave(250));
+    eventStream.onerror = () => {
+      if (eventStream?.readyState === EventSource.CLOSED) eventStream = null;
+    };
   };
 
   applySave(INITIAL_SAVE);
@@ -1748,9 +1790,10 @@ function createSpectatorControllerScript(roomId: string, playerId: PlayerId) {
     installInputGuards();
     syncVisibleStatsFromSave();
     syncSave();
-    window.setInterval(syncSave, ${SPECTATOR_SAVE_SYNC_INTERVAL_MS});
+    startSaveEventStream();
+    window.setInterval(() => scheduleSyncSave(0), ${SPECTATOR_SAVE_SYNC_INTERVAL_MS});
     document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) syncSave();
+      if (!document.hidden) scheduleSyncSave(0);
     });
   };
 
