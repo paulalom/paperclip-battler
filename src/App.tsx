@@ -27,7 +27,9 @@ const ROOM_ID_KEY = "paperclip-battler:room-id";
 const ROOM_SESSION_ID_KEY = "paperclip-battler:room-session-id";
 const ROOM_PLAYER_PREFERENCE_KEY = "paperclip-battler:room-player-preferences";
 const EMBED_LOBBY_MESSAGE_TYPE = "paperclip-battler:lobby-ready";
+const PLAYER_FRAME_REFRESH_MESSAGE_TYPE = "paperclip-battler:refresh";
 const ROOM_SLOT_HEARTBEAT_MS = 4_000;
+const FOREGROUND_HEALTH_REFRESH_DELAY_MS = 150;
 const DEFAULT_ROOM_ID = "local";
 const PLAYER_IDS = ["left", "right"] as const;
 const PLAYER_LABELS: Record<PlayerId, string> = {
@@ -210,6 +212,14 @@ function notifyEmbeddedHost(roomId: string, view: RoomView) {
     },
     "*"
   );
+}
+
+function postMessageTargetOrigin(baseUrl: string) {
+  try {
+    return new URL(baseUrl, window.location.href).origin;
+  } catch {
+    return "*";
+  }
 }
 
 function parseGameOverPayload(event: MessageEvent): WinnerOverlay | null {
@@ -449,6 +459,20 @@ export function App() {
     });
   }, []);
 
+  const requestPlayerFrameRefresh = useCallback(() => {
+    const targetOrigin = postMessageTargetOrigin(trimmedBridgeUrl);
+    const message = {
+      source: "paperclip-battler",
+      type: PLAYER_FRAME_REFRESH_MESSAGE_TYPE,
+      roomId,
+      requestedAt: Date.now()
+    };
+
+    for (const frame of [leftFrame.current, rightFrame.current]) {
+      frame?.contentWindow?.postMessage(message, targetOrigin);
+    }
+  }, [roomId, trimmedBridgeUrl]);
+
   const mergeBridgePayload = useCallback(
     (payload: unknown) => {
       applyBridgePlayerModes(readPlayerModeUpdates(payload));
@@ -625,8 +649,11 @@ export function App() {
     if (useDefaultLobby) return undefined;
 
     let cancelled = false;
+    let foregroundRefreshTimer: number | null = null;
 
-    async function pollHealth() {
+    async function pollHealth(options: { force?: boolean } = {}) {
+      if (!options.force && document.hidden) return;
+
       try {
         const response = await fetch(`${trimmedBridgeUrl}/health?room=${encodeURIComponent(roomId)}`, { cache: "no-store" });
         if (response.status === 410 && followDefaultLobby) {
@@ -652,17 +679,44 @@ export function App() {
       }
     }
 
+    const refreshVisibleState = () => {
+      if (document.hidden) return;
+
+      requestPlayerFrameRefresh();
+      void pollHealth({ force: true });
+
+      if (foregroundRefreshTimer !== null) {
+        window.clearTimeout(foregroundRefreshTimer);
+      }
+      foregroundRefreshTimer = window.setTimeout(() => {
+        foregroundRefreshTimer = null;
+        void pollHealth({ force: true });
+      }, FOREGROUND_HEALTH_REFRESH_DELAY_MS);
+    };
+
+    const refreshOnVisibility = () => {
+      if (!document.hidden) refreshVisibleState();
+    };
+
     setStatus("checking");
-    pollHealth();
-    const timer = window.setInterval(pollHealth, 1_250);
+    refreshVisibleState();
+    const timer = window.setInterval(() => void pollHealth(), 1_250);
+    document.addEventListener("visibilitychange", refreshOnVisibility);
+    window.addEventListener("focus", refreshVisibleState);
+    window.addEventListener("pageshow", refreshVisibleState);
     return () => {
       cancelled = true;
+      if (foregroundRefreshTimer !== null) window.clearTimeout(foregroundRefreshTimer);
       window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refreshOnVisibility);
+      window.removeEventListener("focus", refreshVisibleState);
+      window.removeEventListener("pageshow", refreshVisibleState);
     };
   }, [
     embedded,
     applyBridgePlayerModes,
     followDefaultLobby,
+    requestPlayerFrameRefresh,
     roomId,
     roomView,
     trimmedBridgeUrl,

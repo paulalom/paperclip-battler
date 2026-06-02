@@ -3810,6 +3810,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   const COMMAND_URL = "/player-control/next-command?" + ROOM_QUERY;
   const RESULT_URL = "/player-control/result?" + ROOM_QUERY;
   const HEURISTIC_TICK_URL = "/player-control/heuristic-ticks?" + ROOM_QUERY;
+  const FRAME_REFRESH_MESSAGE_TYPE = "paperclip-battler:refresh";
   const INTERACTIVE_SELECTOR =
     'button,input:not([type="hidden"]),select,textarea,a[onclick],[role="button"]';
   const SHIELD_EVENTS = [
@@ -4793,13 +4794,34 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     }
   };
 
+  const refreshNow = () => {
+    startHeuristicTickStream();
+    void refreshConfig();
+    void poll();
+    void report();
+  };
+
+  const handleFrameRefreshMessage = (event) => {
+    const data = event.data;
+    if (!data || typeof data !== "object") return;
+    if (data.source !== "paperclip-battler" || data.type !== FRAME_REFRESH_MESSAGE_TYPE) return;
+    if (data.roomId && data.roomId !== ROOM_ID) return;
+    refreshNow();
+  };
+
+  const refreshWhenVisible = () => {
+    if (!document.hidden) refreshNow();
+  };
+
   installStyles();
   setPlayerMode("human");
   setReadyState(false, false);
-  refreshConfig();
-  report();
-  startHeuristicTickStream();
-  window.addEventListener("load", report);
+  refreshNow();
+  window.addEventListener("message", handleFrameRefreshMessage);
+  window.addEventListener("load", refreshNow);
+  window.addEventListener("focus", refreshNow);
+  window.addEventListener("pageshow", refreshNow);
+  document.addEventListener("visibilitychange", refreshWhenVisible);
   window.addEventListener("click", () => {
     if (Date.now() < suppressClickReportUntil) return;
     scheduleReport(80);
