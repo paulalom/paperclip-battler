@@ -850,15 +850,26 @@ function startBridge() {
       }
 
       if (request.method === "POST" && url.pathname === "/rooms") {
-        const body = await readJsonBody<{ id?: string; title?: string; tinyState?: Record<string, unknown> }>(request);
+        const body = await readJsonBody<{
+          id?: string;
+          title?: string;
+          tinyState?: Record<string, unknown>;
+          hostSessionId?: string;
+          sessionId?: string;
+        }>(request);
         const roomId = body.id ? normalizeRoomId(body.id) : createShortRoomId();
         const room = getRoomState(roomId, body.title, { reopenClosed: true });
         if (body.title) room.title = normalizeRoomTitle(body.title, roomId);
         if (isRecord(body.tinyState)) room.tinyState = body.tinyState;
+        const hostParticipant = body.hostSessionId || body.sessionId ? joinRoomParticipant(roomId, body.hostSessionId ?? body.sessionId) : null;
         markRoomActivity(roomId);
         touchRoom(roomId);
         emitRoomEvent(roomId, "room", { room: serializeRoom(roomId) });
-        sendJson(response, 201, { ok: true, room: serializeRoom(roomId) });
+        sendJson(response, 201, {
+          ok: true,
+          room: serializeRoom(roomId),
+          participant: hostParticipant ? serializeRoomParticipant(hostParticipant, true) : undefined
+        });
         return;
       }
 

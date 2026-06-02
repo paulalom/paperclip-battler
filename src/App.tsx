@@ -406,7 +406,8 @@ export function App() {
   const playUrl = `${window.location.origin}/rooms/${encodeURIComponent(roomId)}`;
   const watchUrl = `${window.location.origin}/watch/${encodeURIComponent(roomId)}`;
   const bothHumanControlled = PLAYER_IDS.every((playerId) => playerModeAllowsHumanInput(playerModes[playerId]));
-  const usesRoomSlots = roomSlotsEnabled && roomView === "play" && !useDefaultLobby && (embedded || bothHumanControlled);
+  const reservesRoomSlot = roomSlotsEnabled && roomView === "play" && !useDefaultLobby;
+  const usesRoomSlots = reservesRoomSlot && (embedded || bothHumanControlled);
   const gameStartedAt = health?.room?.gameStartedAt ?? health?.gameStartedAt ?? null;
   const elapsedGameMs = gameStartedAt ? timerNow - gameStartedAt : health?.room?.elapsedGameMs ?? health?.elapsedGameMs ?? 0;
   const elapsedGameTime = formatElapsedGameTime(elapsedGameMs);
@@ -722,7 +723,7 @@ export function App() {
   }, [roomId]);
 
   useEffect(() => {
-    if (!usesRoomSlots || !roomId) {
+    if (!reservesRoomSlot || !roomId) {
       setRoomParticipant(null);
       return undefined;
     }
@@ -777,7 +778,7 @@ export function App() {
       window.removeEventListener("pagehide", leaveParticipant);
       leaveParticipant();
     };
-  }, [roomId, trimmedBridgeUrl, usesRoomSlots]);
+  }, [reservesRoomSlot, roomId, trimmedBridgeUrl]);
 
   function playerUrl(playerId: PlayerId) {
     return `${trimmedBridgeUrl}/rooms/${encodeURIComponent(roomId)}/players/${playerId}/index2.html`;
@@ -908,11 +909,18 @@ export function App() {
       const response = await fetch(`${trimmedBridgeUrl}/rooms`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: "Paperclip Battler" })
+        body: JSON.stringify({ title: "Paperclip Battler", hostSessionId: roomSessionIdRef.current })
       });
       if (!response.ok) throw new Error(`Bridge returned ${response.status}`);
-      const payload = (await response.json()) as { room?: BridgeRoom };
+      const payload = (await response.json()) as { room?: BridgeRoom; participant?: BridgeRoomParticipant };
       if (!payload.room?.id) throw new Error("Bridge did not return a room id.");
+      if (payload.participant) {
+        if (payload.participant.sessionId && payload.participant.sessionId !== roomSessionIdRef.current) {
+          roomSessionIdRef.current = payload.participant.sessionId;
+          sessionStorage.setItem(ROOM_SESSION_ID_KEY, payload.participant.sessionId);
+        }
+        setRoomParticipant(payload.participant);
+      }
       navigateRoom(payload.room.id, "play");
       setRoomNotice(`Room ${payload.room.id} ready`);
     } catch {
