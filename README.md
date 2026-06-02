@@ -54,13 +54,13 @@ For embedded hosts, create rooms through the bridge API and link users to `/embe
 
 Room-aware bridge endpoints:
 
-- `POST /rooms` with optional `{ "title": "Paperclip Battler", "hostSessionId": "..." }`
+- `POST /rooms` with optional `{ "title": "Paperclip Battler", "hostSessionId": "...", "hostPlayer": "left" }`
 - `GET /lobbies/default`
 - `POST /lobbies/default/rotate`
 - `GET /rooms`
 - `GET /rooms/:id`
-- `POST /rooms/:id/participants`
-- `POST /rooms/:id/participants/heartbeat`
+- `POST /rooms/:id/participants` with optional `{ "sessionId": "...", "preferredPlayer": "left" }`
+- `POST /rooms/:id/participants/heartbeat` with optional `{ "sessionId": "...", "preferredPlayer": "left" }`
 - `POST /rooms/:id/participants/leave`
 - `POST /rooms/:id/activity` to keep an unfinished room active
 - `GET /watch/:id`

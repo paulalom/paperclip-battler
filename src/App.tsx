@@ -25,6 +25,7 @@ const BRIDGE_URL_KEY = "paperclip-battler:bridge-url";
 const PLAYER_MODE_KEY = "paperclip-battler:player-modes";
 const ROOM_ID_KEY = "paperclip-battler:room-id";
 const ROOM_SESSION_ID_KEY = "paperclip-battler:room-session-id";
+const ROOM_PLAYER_PREFERENCE_KEY = "paperclip-battler:room-player-preferences";
 const EMBED_LOBBY_MESSAGE_TYPE = "paperclip-battler:lobby-ready";
 const ROOM_SLOT_HEARTBEAT_MS = 4_000;
 const DEFAULT_ROOM_ID = "local";
@@ -396,6 +397,7 @@ export function App() {
   const roomSessionIdRef = useRef(readRoomSessionId());
   const lastActivityPostRef = useRef(0);
   const pendingModeSyncRef = useRef<Partial<Record<PlayerId, PlayerMode>>>({});
+  const roomParticipantRef = useRef<BridgeRoomParticipant | null>(null);
 
   const frameRefs: Record<PlayerId, React.RefObject<HTMLIFrameElement>> = {
     left: leftFrame,
@@ -721,6 +723,13 @@ export function App() {
   }, [roomId]);
 
   useEffect(() => {
+    roomParticipantRef.current = roomParticipant;
+    if (roomParticipant?.role === "player" && roomParticipant.player) {
+      writeRoomPreferredPlayer(roomId, roomParticipant.player);
+    }
+  }, [roomId, roomParticipant]);
+
+  useEffect(() => {
     if (!reservesRoomSlot || !roomId) {
       setRoomParticipant(null);
       return undefined;
@@ -731,7 +740,7 @@ export function App() {
       const response = await fetch(`${trimmedBridgeUrl}/rooms/${encodeURIComponent(roomId)}/${path}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId: roomSessionIdRef.current })
+        body: JSON.stringify({ sessionId: roomSessionIdRef.current, preferredPlayer: roomParticipantRef.current?.player ?? readRoomPreferredPlayer(roomId) })
       });
       if (!response.ok) throw new Error(`Bridge returned ${response.status}`);
       const payload = (await response.json()) as { participant?: BridgeRoomParticipant };
@@ -739,6 +748,9 @@ export function App() {
         if (payload.participant.sessionId && payload.participant.sessionId !== roomSessionIdRef.current) {
           roomSessionIdRef.current = payload.participant.sessionId;
           sessionStorage.setItem(ROOM_SESSION_ID_KEY, payload.participant.sessionId);
+        }
+        if (payload.participant.role === "player" && payload.participant.player) {
+          writeRoomPreferredPlayer(roomId, payload.participant.player);
         }
         setRoomParticipant(payload.participant);
         setStatus("connected");
@@ -910,6 +922,8 @@ export function App() {
 
   function watchRoom() {
     const targetRoomId = roomId;
+    clearRoomPreferredPlayer(targetRoomId);
+    roomParticipantRef.current = null;
     setRoomParticipant(null);
     void sendRoomParticipantLeave(targetRoomId).catch(() => setStatus("offline"));
     navigateRoom(targetRoomId, "watch");
@@ -920,7 +934,7 @@ export function App() {
       const response = await fetch(`${trimmedBridgeUrl}/rooms`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: "Paperclip Battler", hostSessionId: roomSessionIdRef.current })
+        body: JSON.stringify({ title: "Paperclip Battler", hostSessionId: roomSessionIdRef.current, hostPlayer: "left" })
       });
       if (!response.ok) throw new Error(`Bridge returned ${response.status}`);
       const payload = (await response.json()) as { room?: BridgeRoom; participant?: BridgeRoomParticipant };
@@ -929,6 +943,9 @@ export function App() {
         if (payload.participant.sessionId && payload.participant.sessionId !== roomSessionIdRef.current) {
           roomSessionIdRef.current = payload.participant.sessionId;
           sessionStorage.setItem(ROOM_SESSION_ID_KEY, payload.participant.sessionId);
+        }
+        if (payload.participant.role === "player" && payload.participant.player) {
+          writeRoomPreferredPlayer(payload.room.id, payload.participant.player);
         }
         setRoomParticipant(payload.participant);
       }
@@ -1521,6 +1538,36 @@ function readRoomSessionId() {
   const next = createRoomSessionId();
   sessionStorage.setItem(ROOM_SESSION_ID_KEY, next);
   return next;
+}
+
+function readRoomPreferredPlayer(roomId: string): PlayerId | null {
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(ROOM_PLAYER_PREFERENCE_KEY) ?? "{}") as Partial<Record<string, unknown>>;
+    const player = saved[normalizeRoomId(roomId)];
+    return player === "left" || player === "right" ? player : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeRoomPreferredPlayer(roomId: string, playerId: PlayerId) {
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(ROOM_PLAYER_PREFERENCE_KEY) ?? "{}") as Record<string, unknown>;
+    saved[normalizeRoomId(roomId)] = playerId;
+    sessionStorage.setItem(ROOM_PLAYER_PREFERENCE_KEY, JSON.stringify(saved));
+  } catch {
+    sessionStorage.setItem(ROOM_PLAYER_PREFERENCE_KEY, JSON.stringify({ [normalizeRoomId(roomId)]: playerId }));
+  }
+}
+
+function clearRoomPreferredPlayer(roomId: string) {
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(ROOM_PLAYER_PREFERENCE_KEY) ?? "{}") as Record<string, unknown>;
+    delete saved[normalizeRoomId(roomId)];
+    sessionStorage.setItem(ROOM_PLAYER_PREFERENCE_KEY, JSON.stringify(saved));
+  } catch {
+    sessionStorage.removeItem(ROOM_PLAYER_PREFERENCE_KEY);
+  }
 }
 
 function createRoomSessionId() {

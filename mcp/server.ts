@@ -856,12 +856,14 @@ function startBridge() {
           tinyState?: Record<string, unknown>;
           hostSessionId?: string;
           sessionId?: string;
+          hostPlayer?: string;
         }>(request);
         const roomId = body.id ? normalizeRoomId(body.id) : createShortRoomId();
         const room = getRoomState(roomId, body.title, { reopenClosed: true });
         if (body.title) room.title = normalizeRoomTitle(body.title, roomId);
         if (isRecord(body.tinyState)) room.tinyState = body.tinyState;
-        const hostParticipant = body.hostSessionId || body.sessionId ? joinRoomParticipant(roomId, body.hostSessionId ?? body.sessionId) : null;
+        const hostParticipant =
+          body.hostSessionId || body.sessionId ? joinRoomParticipant(roomId, body.hostSessionId ?? body.sessionId, body.hostPlayer ?? "left") : null;
         markRoomActivity(roomId);
         touchRoom(roomId);
         emitRoomEvent(roomId, "room", { room: serializeRoom(roomId) });
@@ -1204,8 +1206,8 @@ async function handleRoomPath(
   }
 
   if (request.method === "POST" && roomPath.kind === "rooms" && roomPath.rest === "/participants") {
-    const body = await readJsonBody<{ sessionId?: string }>(request);
-    const participant = joinRoomParticipant(roomId, body.sessionId);
+    const body = await readJsonBody<{ sessionId?: string; preferredPlayer?: string }>(request);
+    const participant = joinRoomParticipant(roomId, body.sessionId, body.preferredPlayer);
     sendJson(response, 200, {
       ok: true,
       room: serializeRoom(roomId),
@@ -1215,8 +1217,8 @@ async function handleRoomPath(
   }
 
   if (request.method === "POST" && roomPath.kind === "rooms" && roomPath.rest === "/participants/heartbeat") {
-    const body = await readJsonBody<{ sessionId?: string }>(request);
-    const participant = heartbeatRoomParticipant(roomId, body.sessionId);
+    const body = await readJsonBody<{ sessionId?: string; preferredPlayer?: string }>(request);
+    const participant = heartbeatRoomParticipant(roomId, body.sessionId, body.preferredPlayer);
     sendJson(response, 200, {
       ok: true,
       room: serializeRoom(roomId),
@@ -2637,12 +2639,13 @@ function serializeRoom(roomId: string) {
   };
 }
 
-function joinRoomParticipant(roomId: string, value: unknown) {
+function joinRoomParticipant(roomId: string, value: unknown, preferredPlayerValue?: unknown) {
   const room = getRoomState(roomId);
   const now = Date.now();
   cleanupRoomParticipants(room, now);
 
   const sessionId = normalizeRoomSessionId(value);
+  const preferredPlayer = normalizePreferredPlayerId(preferredPlayerValue);
   const existing = room.participants.get(sessionId);
   const occupied = new Set(
     getActiveRoomParticipants(room, now)
@@ -2657,7 +2660,10 @@ function joinRoomParticipant(roomId: string, value: unknown) {
     return existing;
   }
 
-  const openPlayer = PLAYER_IDS.find((playerId) => !occupied.has(playerId)) ?? null;
+  const openPlayer =
+    preferredPlayer && !occupied.has(preferredPlayer)
+      ? preferredPlayer
+      : PLAYER_IDS.find((playerId) => !occupied.has(playerId)) ?? null;
   const participant: RoomParticipant = {
     sessionId,
     role: openPlayer ? "player" : "observer",
@@ -2673,14 +2679,14 @@ function joinRoomParticipant(roomId: string, value: unknown) {
   return participant;
 }
 
-function heartbeatRoomParticipant(roomId: string, value: unknown) {
+function heartbeatRoomParticipant(roomId: string, value: unknown, preferredPlayerValue?: unknown) {
   const room = getRoomState(roomId);
   const now = Date.now();
   cleanupRoomParticipants(room, now);
 
   const sessionId = normalizeRoomSessionId(value);
   const participant = room.participants.get(sessionId);
-  if (!participant) return joinRoomParticipant(roomId, sessionId);
+  if (!participant) return joinRoomParticipant(roomId, sessionId, preferredPlayerValue);
 
   participant.lastSeenAt = now;
   touchRoom(roomId);
@@ -3649,6 +3655,14 @@ function normalizePlayerId(value: unknown): PlayerId {
   if (normalized === "left" || normalized === "player" || normalized === "p1" || normalized === "1") return "left";
   if (normalized === "right" || normalized === "agent" || normalized === "p2" || normalized === "2") return "right";
   throw new Error("Player must be left/player/1 or right/agent/2.");
+}
+
+function normalizePreferredPlayerId(value: unknown): PlayerId | null {
+  try {
+    return value === undefined || value === null || value === "" ? null : normalizePlayerId(value);
+  } catch {
+    return null;
+  }
 }
 
 function normalizePlayerMode(value: unknown): PlayerMode {
