@@ -1156,7 +1156,7 @@ export function App() {
                   source={isAssignedPlayer ? playerUrl(playerId) : spectatorUrl(playerId)}
                   mode={isAssignedPlayer ? playerModes[playerId] : health?.players?.[playerId]?.mode ?? playerModes[playerId]}
                   health={health?.players?.[playerId]}
-                  frameRef={isAssignedPlayer ? frameRefs[playerId] : undefined}
+                  frameRef={frameRefs[playerId]}
                   disabled={status === "offline"}
                   allPlayersReady={Boolean(health?.allPlayersReady)}
                   elapsedGameTime={elapsedGameTime}
@@ -1376,7 +1376,7 @@ function OriginalPane({
         : `Mark ${title} ready`;
 
   return (
-    <article className={`pane mode-${mode} ${readOnly ? "read-only" : ""}`}>
+    <article className={`pane mode-${mode} ${readOnly ? "read-only" : ""}`} aria-label={title}>
       <div className="pane-toolbar">
         <div className="pane-title">
           <span>{title}</span>

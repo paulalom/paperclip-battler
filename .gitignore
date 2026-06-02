@@ -5,3 +5,5 @@ dist-mcp/
 .paperclip-agent-state.json
 .DS_Store
 *.log
+playwright-report/
+test-results/

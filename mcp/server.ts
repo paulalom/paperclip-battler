@@ -1566,6 +1566,7 @@ function createSpectatorControllerScript(roomId: string, playerId: PlayerId) {
   const INITIAL_SAVE = ${inlineJson(initialSave)};
   const SAVE_URL = "/rooms/" + encodeURIComponent(ROOM_ID) + "/save";
   const EVENTS_URL = "/rooms/" + encodeURIComponent(ROOM_ID) + "/events";
+  const FRAME_REFRESH_MESSAGE_TYPE = "paperclip-battler:refresh";
   const BLOCK_EVENTS = [
     "pointerdown",
     "pointerup",
@@ -1873,6 +1874,18 @@ function createSpectatorControllerScript(roomId: string, playerId: PlayerId) {
     };
   };
 
+  const handleFrameRefreshMessage = (event) => {
+    const data = event.data;
+    if (!data || typeof data !== "object") return;
+    if (data.source !== "paperclip-battler" || data.type !== FRAME_REFRESH_MESSAGE_TYPE) return;
+    if (data.roomId && data.roomId !== ROOM_ID) return;
+    scheduleSyncSave(0);
+  };
+
+  const syncWhenVisible = () => {
+    if (!document.hidden) scheduleSyncSave(0);
+  };
+
   applySave(INITIAL_SAVE);
 
   const start = () => {
@@ -1881,9 +1894,10 @@ function createSpectatorControllerScript(roomId: string, playerId: PlayerId) {
     syncSave();
     startSaveEventStream();
     window.setInterval(() => scheduleSyncSave(0), ${SPECTATOR_SAVE_SYNC_INTERVAL_MS});
-    document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) scheduleSyncSave(0);
-    });
+    window.addEventListener("message", handleFrameRefreshMessage);
+    window.addEventListener("focus", syncWhenVisible);
+    window.addEventListener("pageshow", syncWhenVisible);
+    document.addEventListener("visibilitychange", syncWhenVisible);
   };
 
   if (document.readyState === "loading") {
@@ -4645,6 +4659,7 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     lastReportAt = Date.now();
 
     try {
+      flushGameSave();
       await fetch(REPORT_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -4717,6 +4732,14 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
       if (key) values[key] = storage.getItem(key) || "";
     }
     return values;
+  };
+
+  const flushGameSave = () => {
+    try {
+      if (typeof window.save === "function") window.save();
+    } catch {
+      // The original page may still be initializing.
+    }
   };
 
   const importStorage = (storage, values) => {
