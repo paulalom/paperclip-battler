@@ -48,6 +48,8 @@ Paperclip Battler can create short room ids for browser-run multiplayer sessions
 
 Use the room controls in the app header to create a room, copy a play link like `/rooms/abc123`, copy a watch link like `/watch/abc123`, export the room JSON, or import a room JSON file. Watch links open the same two-pane game layout with read-only spectator frames.
 
+When both player panes allow human input, room play links assign one active browser session to each player slot. Each human can use controls and game input only on their assigned side; the other side is shown as watch-only.
+
 For embedded hosts, create rooms through the bridge API and link users to `/embed/abc123` for play or `/embed/watch/abc123` for spectator mode. `/embed?lobby=default` resolves to the current default lobby, creating it through the bridge when needed. The default lobby is an attract-mode heuristic-vs-heuristic match and defaults to watch-only; pass `view=play` only when a host intentionally wants player-slot assignment. Existing `/rooms/abc123?embed=1` and `/watch/abc123?embed=1` links also enable embedded mode. Embedded play mode assigns one active browser session to each player slot; once both slots are occupied, later sessions load as observers. Embedded mode keeps the player panes visible but hides the app header, room creation/copy/export/import controls, bridge URL, and Paperclip Battler branding. Hosts can pass `?bridgeUrl=http%3A%2F%2F127.0.0.1%3A8787` when they need the embedded page to use a specific bridge.
 
 Room-aware bridge endpoints:

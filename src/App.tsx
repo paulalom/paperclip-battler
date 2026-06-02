@@ -19,7 +19,7 @@ import {
   User,
   Users
 } from "lucide-react";
-import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 const ORIGINAL_URL = "https://www.decisionproblem.com/paperclips/index2.html";
 const BRIDGE_URL_KEY = "paperclip-battler:bridge-url";
@@ -35,6 +35,10 @@ const PLAYER_LABELS: Record<PlayerId, string> = {
   right: "Player 2"
 };
 
+type PlayerModeSyncResponse = Partial<Pick<BridgeHealth, "allPlayersReady" | "players" | "room">> & {
+  player?: Partial<BridgePlayerHealth>;
+};
+
 async function syncPlayerModeToBridge(baseUrl: string, roomId: string, playerId: PlayerId, mode: PlayerMode) {
   const response = await fetch(`${baseUrl}/players/mode?room=${encodeURIComponent(roomId)}`, {
     method: "POST",
@@ -42,11 +46,9 @@ async function syncPlayerModeToBridge(baseUrl: string, roomId: string, playerId:
     body: JSON.stringify({ room: roomId, player: playerId, mode })
   });
   if (!response.ok) throw new Error("Bridge rejected player mode sync.");
+  return (await response.json()) as PlayerModeSyncResponse;
 }
 
-async function syncPlayerModesToBridge(baseUrl: string, roomId: string, modes: Record<PlayerId, PlayerMode>) {
-  await Promise.all(PLAYER_IDS.map((playerId) => syncPlayerModeToBridge(baseUrl, roomId, playerId, modes[playerId])));
-}
 const DEFAULT_PLAYER_MODES: Record<PlayerId, PlayerMode> = {
   left: "human",
   right: "agent"
@@ -258,6 +260,106 @@ function readTimestampFromTtl(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) ? Date.now() + Math.max(0, value) : null;
 }
 
+function readPlayerModeUpdates(payload: unknown) {
+  const updates: Partial<Record<PlayerId, PlayerMode>> = {};
+  if (!isRecordValue(payload)) return updates;
+
+  addPlayerModeUpdate(updates, payload.player);
+  addPlayerModeMapUpdates(updates, payload.players);
+
+  const room = isRecordValue(payload.room) ? payload.room : null;
+  if (room) addPlayerModeMapUpdates(updates, room.slots);
+
+  return updates;
+}
+
+function addPlayerModeUpdate(updates: Partial<Record<PlayerId, PlayerMode>>, value: unknown, fallbackPlayerId?: PlayerId) {
+  if (!isRecordValue(value)) return;
+  const playerId = normalizePayloadPlayer(value.id ?? value.player ?? fallbackPlayerId);
+  if (!playerId || !isPlayerMode(value.mode)) return;
+  updates[playerId] = value.mode;
+}
+
+function addPlayerModeMapUpdates(updates: Partial<Record<PlayerId, PlayerMode>>, value: unknown) {
+  if (!isRecordValue(value)) return;
+  for (const playerId of PLAYER_IDS) {
+    addPlayerModeUpdate(updates, value[playerId], playerId);
+  }
+}
+
+function mergeHealthWithPayload(current: BridgeHealth, payload: Record<string, unknown>): BridgeHealth {
+  let next = current;
+  const room = isRecordValue(payload.room) ? (payload.room as BridgeRoom) : null;
+
+  if (room && (room.id === current.roomId || room.id === current.room?.id)) {
+    next = { ...next, room };
+  }
+
+  if (typeof payload.allPlayersReady === "boolean") {
+    next = { ...next, allPlayersReady: payload.allPlayersReady };
+  }
+
+  const playerPatches = readPlayerHealthPatches(payload);
+  if (Object.values(playerPatches).some(Boolean)) {
+    next = {
+      ...next,
+      players: mergePlayerHealthPatches(next.players, playerPatches)
+    };
+  }
+
+  return next;
+}
+
+function readPlayerHealthPatches(payload: Record<string, unknown>) {
+  const patches: Partial<Record<PlayerId, Partial<BridgePlayerHealth>>> = {};
+  addPlayerHealthPatch(patches, payload.player);
+  addPlayerHealthMapPatches(patches, payload.players);
+
+  const room = isRecordValue(payload.room) ? payload.room : null;
+  if (room) addPlayerHealthMapPatches(patches, room.slots);
+
+  return patches;
+}
+
+function addPlayerHealthPatch(patches: Partial<Record<PlayerId, Partial<BridgePlayerHealth>>>, value: unknown, fallbackPlayerId?: PlayerId) {
+  if (!isRecordValue(value)) return;
+  const playerId = normalizePayloadPlayer(value.id ?? value.player ?? fallbackPlayerId);
+  if (!playerId) return;
+  patches[playerId] = {
+    ...patches[playerId],
+    ...(value as Partial<BridgePlayerHealth>),
+    id: playerId
+  };
+}
+
+function addPlayerHealthMapPatches(patches: Partial<Record<PlayerId, Partial<BridgePlayerHealth>>>, value: unknown) {
+  if (!isRecordValue(value)) return;
+  for (const playerId of PLAYER_IDS) {
+    addPlayerHealthPatch(patches, value[playerId], playerId);
+  }
+}
+
+function mergePlayerHealthPatches(
+  current: Partial<Record<PlayerId, BridgePlayerHealth>> | undefined,
+  patches: Partial<Record<PlayerId, Partial<BridgePlayerHealth>>>
+) {
+  const next: Partial<Record<PlayerId, BridgePlayerHealth>> = { ...(current ?? {}) };
+  for (const playerId of PLAYER_IDS) {
+    const patch = patches[playerId];
+    if (!patch) continue;
+    next[playerId] = {
+      ...(next[playerId] ?? {}),
+      ...patch,
+      id: playerId
+    } as BridgePlayerHealth;
+  }
+  return next;
+}
+
+function normalizePayloadPlayer(value: unknown): PlayerId | null {
+  return value === "left" || value === "right" ? value : null;
+}
+
 function shouldResumeDefaultLobby(health: BridgeHealth) {
   const expiresAt = health.room?.expiresAt;
   if (typeof expiresAt === "number" && expiresAt <= Date.now()) return true;
@@ -281,6 +383,7 @@ export function App() {
   const [embedded, setEmbedded] = useState(() => initialRoute.embedded);
   const [useDefaultLobby, setUseDefaultLobby] = useState(() => initialRoute.defaultLobby);
   const [followDefaultLobby, setFollowDefaultLobby] = useState(() => initialRoute.followDefaultLobby);
+  const [roomSlotsEnabled, setRoomSlotsEnabled] = useState(() => initialRoute.embedded || Boolean(initialRoute.roomId));
   const [roomNotice, setRoomNotice] = useState("");
   const [playerModes, setPlayerModes] = useState<Record<PlayerId, PlayerMode>>(readPlayerModes);
   const [health, setHealth] = useState<BridgeHealth | null>(null);
@@ -293,6 +396,7 @@ export function App() {
   const rightFrame = useRef<HTMLIFrameElement>(null);
   const roomSessionIdRef = useRef(readRoomSessionId());
   const lastActivityPostRef = useRef(0);
+  const pendingModeSyncRef = useRef<Partial<Record<PlayerId, PlayerMode>>>({});
 
   const frameRefs: Record<PlayerId, React.RefObject<HTMLIFrameElement>> = {
     left: leftFrame,
@@ -301,7 +405,8 @@ export function App() {
   const trimmedBridgeUrl = useMemo(() => bridgeUrl.replace(/\/+$/, ""), [bridgeUrl]);
   const playUrl = `${window.location.origin}/rooms/${encodeURIComponent(roomId)}`;
   const watchUrl = `${window.location.origin}/watch/${encodeURIComponent(roomId)}`;
-  const usesRoomSlots = embedded && roomView === "play" && !useDefaultLobby;
+  const bothHumanControlled = PLAYER_IDS.every((playerId) => playerModeAllowsHumanInput(playerModes[playerId]));
+  const usesRoomSlots = roomSlotsEnabled && roomView === "play" && !useDefaultLobby && (embedded || bothHumanControlled);
   const gameStartedAt = health?.room?.gameStartedAt ?? health?.gameStartedAt ?? null;
   const elapsedGameMs = gameStartedAt ? timerNow - gameStartedAt : health?.room?.elapsedGameMs ?? health?.elapsedGameMs ?? 0;
   const elapsedGameTime = formatElapsedGameTime(elapsedGameMs);
@@ -314,6 +419,46 @@ export function App() {
     : null;
   const roomWarnings = health?.room?.warnings ?? [];
   const roomWarningClosesAt = roomWarnings[0]?.closesAt ?? null;
+
+  const applyBridgePlayerModes = useCallback((updates: Partial<Record<PlayerId, PlayerMode>>) => {
+    setPlayerModes((current) => {
+      let changed = false;
+      const next = { ...current };
+
+      for (const playerId of PLAYER_IDS) {
+        const mode = updates[playerId];
+        if (!mode) continue;
+
+        const pendingMode = pendingModeSyncRef.current[playerId];
+        if (pendingMode) {
+          if (pendingMode === mode) {
+            delete pendingModeSyncRef.current[playerId];
+          } else {
+            continue;
+          }
+        }
+
+        if (next[playerId] !== mode) {
+          next[playerId] = mode;
+          changed = true;
+        }
+      }
+
+      return changed ? next : current;
+    });
+  }, []);
+
+  const mergeBridgePayload = useCallback(
+    (payload: unknown) => {
+      applyBridgePlayerModes(readPlayerModeUpdates(payload));
+
+      setHealth((current) => {
+        if (!current || !isRecordValue(payload)) return current;
+        return mergeHealthWithPayload(current, payload);
+      });
+    },
+    [applyBridgePlayerModes]
+  );
 
   useEffect(() => {
     if (!embedded || useDefaultLobby || !roomId) return;
@@ -336,6 +481,7 @@ export function App() {
       setEmbedded(nextRoute.embedded);
       setUseDefaultLobby(nextRoute.defaultLobby);
       setFollowDefaultLobby(nextRoute.followDefaultLobby);
+      setRoomSlotsEnabled(nextRoute.embedded || Boolean(nextRoute.roomId));
       setWinnerOverlay(null);
     };
     window.addEventListener("popstate", onPopState);
@@ -345,6 +491,15 @@ export function App() {
   useEffect(() => {
     localStorage.setItem(PLAYER_MODE_KEY, JSON.stringify(playerModes));
   }, [playerModes]);
+
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== PLAYER_MODE_KEY) return;
+      applyBridgePlayerModes(readPlayerModes());
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, [applyBridgePlayerModes]);
 
   useEffect(() => {
     setTimerNow(Date.now());
@@ -406,6 +561,7 @@ export function App() {
     setRoomView(roomView);
     setUseDefaultLobby(false);
     setFollowDefaultLobby(true);
+    setRoomSlotsEnabled(true);
     setRoomNotice(options.notice ?? `Lobby ${payload.room.id} ready`);
     window.history.replaceState({}, "", roomRoutePath(payload.room.id, roomView, embedded, { followDefaultLobby: true }));
     return true;
@@ -437,11 +593,21 @@ export function App() {
     async function syncModes() {
       try {
         if (roomView === "watch") return;
-        if (usesRoomSlots) {
-          if (roomParticipant?.role !== "player" || !roomParticipant.player) return;
-          await syncPlayerModeToBridge(trimmedBridgeUrl, roomId, roomParticipant.player, playerModes[roomParticipant.player]);
-        } else {
-          await syncPlayerModesToBridge(trimmedBridgeUrl, roomId, playerModes);
+        const pendingPlayerIds = PLAYER_IDS.filter((playerId) => pendingModeSyncRef.current[playerId] === playerModes[playerId]);
+        if (!pendingPlayerIds.length) return;
+
+        const payloads = await Promise.all(
+          pendingPlayerIds.map((playerId) => syncPlayerModeToBridge(trimmedBridgeUrl, roomId, playerId, playerModes[playerId]))
+        );
+        if (cancelled) return;
+
+        for (const playerId of pendingPlayerIds) {
+          if (pendingModeSyncRef.current[playerId] === playerModes[playerId]) {
+            delete pendingModeSyncRef.current[playerId];
+          }
+        }
+        for (const payload of payloads) {
+          mergeBridgePayload(payload);
         }
       } catch {
         if (!cancelled) setStatus("offline");
@@ -452,7 +618,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [playerModes, roomId, roomParticipant?.player, roomParticipant?.role, roomView, trimmedBridgeUrl, useDefaultLobby, usesRoomSlots]);
+  }, [mergeBridgePayload, playerModes, roomId, roomView, trimmedBridgeUrl, useDefaultLobby]);
 
   useEffect(() => {
     if (useDefaultLobby) return undefined;
@@ -472,37 +638,7 @@ export function App() {
           await resolveDefaultLobbyRoute({ cancelled: () => cancelled, notice: "Default lobby resumed" });
           return;
         }
-        const managedPlayerIds =
-          roomView === "watch"
-            ? []
-            : usesRoomSlots && roomParticipant?.role === "player" && roomParticipant.player
-            ? [roomParticipant.player]
-            : usesRoomSlots
-              ? []
-              : [...PLAYER_IDS];
-        const bridgeModeMismatch = managedPlayerIds.some((playerId) => nextHealth.players?.[playerId]?.mode !== playerModes[playerId]);
-        if (bridgeModeMismatch) {
-          await Promise.all(
-            managedPlayerIds.map((playerId) => syncPlayerModeToBridge(trimmedBridgeUrl, roomId, playerId, playerModes[playerId]))
-          );
-          const syncedPlayers: Partial<Record<PlayerId, BridgePlayerHealth>> = { ...(nextHealth.players ?? {}) };
-          for (const playerId of managedPlayerIds) {
-            const player = syncedPlayers[playerId];
-            if (!player) continue;
-            const mode = playerModes[playerId];
-            syncedPlayers[playerId] = {
-              ...player,
-              mode,
-              agentEnabled: mode === "agent" || mode === "both",
-              heuristicEnabled: mode === "heuristic",
-              userClicksAllowed: mode === "human" || mode === "both"
-            };
-          }
-          nextHealth = {
-            ...nextHealth,
-            players: syncedPlayers
-          };
-        }
+        applyBridgePlayerModes(readPlayerModeUpdates({ players: nextHealth.players, room: nextHealth.room }));
         if (!cancelled) {
           setHealth(nextHealth);
           setStatus("connected");
@@ -524,11 +660,9 @@ export function App() {
     };
   }, [
     embedded,
+    applyBridgePlayerModes,
     followDefaultLobby,
-    playerModes,
     roomId,
-    roomParticipant?.player,
-    roomParticipant?.role,
     roomView,
     trimmedBridgeUrl,
     useDefaultLobby,
@@ -540,6 +674,15 @@ export function App() {
     let restartTimer: number | null = null;
     const events = new EventSource(`${trimmedBridgeUrl}/rooms/${encodeURIComponent(roomId)}/events`);
     const markConnected = () => setStatus((current) => (current === "offline" ? "checking" : current));
+    const handleBridgeUpdate = (event: MessageEvent) => {
+      markConnected();
+      try {
+        const roomEvent = JSON.parse(event.data) as RoomEvent;
+        mergeBridgePayload(roomEvent.payload);
+      } catch {
+        // Polling will refresh the bridge state if an event payload is malformed.
+      }
+    };
     const handleGameOver = (event: MessageEvent) => {
       const payload = parseGameOverPayload(event);
       if (!payload) return;
@@ -551,6 +694,7 @@ export function App() {
       restartTimer = window.setTimeout(() => {
         setUseDefaultLobby(false);
         setFollowDefaultLobby(true);
+        setRoomSlotsEnabled(true);
         setRoomId(nextRoomId);
         setRoomView(roomView);
         setWinnerOverlay(null);
@@ -561,26 +705,17 @@ export function App() {
       if (!followDefaultLobby) return;
       void resolveDefaultLobbyRoute({ notice: "Default lobby resumed" }).catch(() => setStatus("offline"));
     };
-    const handleRoomWarning = (event: MessageEvent) => {
-      try {
-        const roomEvent = JSON.parse(event.data) as RoomEvent;
-        const room = isRecordValue(roomEvent.payload) && isRecordValue(roomEvent.payload.room) ? (roomEvent.payload.room as BridgeRoom) : null;
-        if (room?.id === roomId) setHealth((current) => (current ? { ...current, room } : current));
-      } catch {
-        // The next health poll will refresh room lifecycle warnings.
-      }
-    };
-    events.addEventListener("snapshot", markConnected);
-    events.addEventListener("room", markConnected);
+    events.addEventListener("snapshot", handleBridgeUpdate);
+    events.addEventListener("room", handleBridgeUpdate);
     events.addEventListener("game-over", handleGameOver);
-    events.addEventListener("room-warning", handleRoomWarning);
+    events.addEventListener("room-warning", handleBridgeUpdate);
     events.addEventListener("room-closed", handleRoomClosed);
     events.onerror = () => events.close();
     return () => {
       if (restartTimer !== null) window.clearTimeout(restartTimer);
       events.close();
     };
-  }, [embedded, followDefaultLobby, roomId, roomView, trimmedBridgeUrl, useDefaultLobby]);
+  }, [embedded, followDefaultLobby, mergeBridgePayload, roomId, roomView, trimmedBridgeUrl, useDefaultLobby]);
 
   useEffect(() => {
     setWinnerOverlay(null);
@@ -731,6 +866,7 @@ export function App() {
   }
 
   function setPlayerMode(playerId: PlayerId, mode: PlayerMode) {
+    pendingModeSyncRef.current[playerId] = mode;
     setPlayerModes((current) => ({ ...current, [playerId]: mode }));
     setHealth((current) => {
       const currentPlayer = current?.players?.[playerId];
@@ -755,6 +891,7 @@ export function App() {
     const normalized = normalizeRoomId(nextRoomId);
     setUseDefaultLobby(false);
     setFollowDefaultLobby(false);
+    setRoomSlotsEnabled(true);
     setWinnerOverlay(null);
     setRoomId(normalized);
     setRoomView(nextView);
@@ -1394,6 +1531,10 @@ function readPlayerModes(): Record<PlayerId, PlayerMode> {
 
 function isPlayerMode(value: unknown): value is PlayerMode {
   return value === "human" || value === "agent" || value === "heuristic" || value === "both";
+}
+
+function playerModeAllowsHumanInput(mode: PlayerMode) {
+  return mode === "human" || mode === "both";
 }
 
 function modeLabel(mode: PlayerMode) {
