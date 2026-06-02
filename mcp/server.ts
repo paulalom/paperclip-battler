@@ -1692,6 +1692,29 @@ function createSpectatorControllerScript(roomId: string, playerId: PlayerId) {
       "background: rgba(255, 255, 255, 0) !important;",
       "touch-action: pan-x pan-y !important;",
       "}",
+      "#paperclip-battler-spectator-tooltip {",
+      "all: initial !important;",
+      "display: block !important;",
+      "box-sizing: border-box !important;",
+      "position: fixed !important;",
+      "left: 12px !important;",
+      "top: 12px !important;",
+      "z-index: 2147483647 !important;",
+      "max-width: min(360px, calc(100vw - 24px)) !important;",
+      "padding: 10px 12px !important;",
+      "border-radius: 7px !important;",
+      "background: rgba(17, 24, 39, 0.96) !important;",
+      "color: #ffffff !important;",
+      "font: 14px/1.4 system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif !important;",
+      "box-shadow: 0 10px 28px rgba(0, 0, 0, 0.26) !important;",
+      "opacity: 0 !important;",
+      "pointer-events: none !important;",
+      "white-space: normal !important;",
+      "transition: opacity 110ms ease !important;",
+      "}",
+      '#paperclip-battler-spectator-tooltip[data-visible="true"] {',
+      "opacity: 1 !important;",
+      "}",
       'html[data-paperclip-battler-spectator="true"] button:not(:disabled),',
       'html[data-paperclip-battler-spectator="true"] input:not([type="hidden"]):not(:disabled),',
       'html[data-paperclip-battler-spectator="true"] select:not(:disabled),',
@@ -1705,6 +1728,66 @@ function createSpectatorControllerScript(roomId: string, playerId: PlayerId) {
     document.head.appendChild(style);
   };
 
+  let tooltip = null;
+  let tooltipTimer = null;
+  let lastTooltipEvent = null;
+
+  const ensureTooltip = () => {
+    if (tooltip?.isConnected) return tooltip;
+    const shield = document.getElementById("paperclip-battler-spectator-shield");
+    if (!shield) return null;
+    tooltip = document.createElement("div");
+    tooltip.id = "paperclip-battler-spectator-tooltip";
+    tooltip.setAttribute("role", "status");
+    tooltip.textContent = "Watch only. Join as a player to control this side.";
+    shield.appendChild(tooltip);
+    return tooltip;
+  };
+
+  const positionTooltip = (event) => {
+    const currentTooltip = ensureTooltip();
+    if (!currentTooltip || typeof event?.clientX !== "number" || typeof event?.clientY !== "number") return;
+    const margin = 10;
+    const offset = 8;
+    currentTooltip.style.maxWidth = Math.max(220, Math.min(360, window.innerWidth - margin * 2)) + "px";
+
+    let left = event.clientX + offset;
+    let top = event.clientY + offset;
+    const rect = currentTooltip.getBoundingClientRect();
+
+    if (left + rect.width > window.innerWidth - margin) {
+      left = Math.max(margin, event.clientX - rect.width - offset);
+    }
+    if (top + rect.height > window.innerHeight - margin) {
+      top = Math.max(margin, event.clientY - rect.height - offset);
+    }
+
+    currentTooltip.style.left = left + "px";
+    currentTooltip.style.top = top + "px";
+  };
+
+  const showTooltip = (event) => {
+    lastTooltipEvent = event;
+    positionTooltip(event);
+    if (tooltip?.dataset.visible === "true" || tooltipTimer) return;
+    tooltipTimer = window.setTimeout(() => {
+      tooltipTimer = null;
+      const currentTooltip = ensureTooltip();
+      if (!currentTooltip) return;
+      if (lastTooltipEvent) positionTooltip(lastTooltipEvent);
+      currentTooltip.dataset.visible = "true";
+    }, 200);
+  };
+
+  const hideTooltip = () => {
+    if (tooltipTimer) {
+      window.clearTimeout(tooltipTimer);
+      tooltipTimer = null;
+    }
+    if (tooltip) delete tooltip.dataset.visible;
+    lastTooltipEvent = null;
+  };
+
   const ensureShield = () => {
     if (!document.body || document.getElementById("paperclip-battler-spectator-shield")) return;
     const shield = document.createElement("div");
@@ -1713,7 +1796,11 @@ function createSpectatorControllerScript(roomId: string, playerId: PlayerId) {
     for (const eventName of BLOCK_EVENTS) {
       shield.addEventListener(eventName, blockTrustedInput, true);
     }
+    shield.addEventListener("pointerenter", showTooltip, true);
+    shield.addEventListener("pointermove", showTooltip, true);
+    shield.addEventListener("pointerleave", hideTooltip, true);
     document.body.appendChild(shield);
+    ensureTooltip();
   };
 
   const installInputGuards = () => {
@@ -3779,6 +3866,8 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   let allPlayersReady = false;
   let inputShield = null;
   let inputTooltip = null;
+  let inputTooltipTimer = null;
+  let lastInputTooltipEvent = null;
   let reportTimer = null;
   let configInFlight = false;
   let reportInFlight = false;
@@ -3837,17 +3926,17 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
       "left: 16px !important;",
       "top: 16px !important;",
       "z-index: 2147483647 !important;",
-      "max-width: min(280px, calc(100vw - 32px)) !important;",
-      "padding: 7px 9px !important;",
-      "border-radius: 6px !important;",
+      "max-width: min(360px, calc(100vw - 24px)) !important;",
+      "padding: 10px 12px !important;",
+      "border-radius: 7px !important;",
       "background: rgba(17, 24, 39, 0.94) !important;",
       "color: #ffffff !important;",
-      "font: 12px/1.35 system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif !important;",
-      "box-shadow: 0 8px 22px rgba(0, 0, 0, 0.22) !important;",
+      "font: 14px/1.4 system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif !important;",
+      "box-shadow: 0 10px 28px rgba(0, 0, 0, 0.26) !important;",
       "opacity: 0 !important;",
       "pointer-events: none !important;",
       "white-space: normal !important;",
-      "transition: opacity 120ms ease !important;",
+      "transition: opacity 110ms ease !important;",
       "}",
       '#paperclip-battler-input-tooltip[data-visible="true"] {',
       "opacity: 1 !important;",
@@ -3918,9 +4007,9 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
   const positionInputTooltip = (event) => {
     const tooltip = ensureInputTooltip();
     if (!tooltip || typeof event?.clientX !== "number" || typeof event?.clientY !== "number") return;
-    const margin = 12;
-    const offset = 14;
-    tooltip.style.maxWidth = Math.max(160, Math.min(280, window.innerWidth - margin * 2)) + "px";
+    const margin = 10;
+    const offset = 8;
+    tooltip.style.maxWidth = Math.max(220, Math.min(360, window.innerWidth - margin * 2)) + "px";
     tooltip.textContent = inputLockMessage();
 
     let left = event.clientX + offset;
@@ -3943,12 +4032,27 @@ const AGENT_CONTROLLER_SCRIPT = String.raw`
     const tooltip = ensureInputTooltip();
     if (!tooltip) return;
     tooltip.textContent = inputLockMessage();
-    tooltip.dataset.visible = "true";
+    lastInputTooltipEvent = event;
     positionInputTooltip(event);
+    if (tooltip.dataset.visible === "true" || inputTooltipTimer) return;
+    inputTooltipTimer = window.setTimeout(() => {
+      inputTooltipTimer = null;
+      if (!userInputLocked()) return hideInputTooltip();
+      const currentTooltip = ensureInputTooltip();
+      if (!currentTooltip) return;
+      currentTooltip.textContent = inputLockMessage();
+      if (lastInputTooltipEvent) positionInputTooltip(lastInputTooltipEvent);
+      currentTooltip.dataset.visible = "true";
+    }, 200);
   };
 
   const hideInputTooltip = () => {
+    if (inputTooltipTimer) {
+      window.clearTimeout(inputTooltipTimer);
+      inputTooltipTimer = null;
+    }
     if (inputTooltip) delete inputTooltip.dataset.visible;
+    lastInputTooltipEvent = null;
   };
 
   const elementSelector = (element, fallbackIndex) => {
