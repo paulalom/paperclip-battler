@@ -46,7 +46,7 @@ The `Ready` button is a shared start gate. User game input, MCP action commands,
 
 Paperclip Battler can create short room ids for browser-run multiplayer sessions. The actual Universal Paperclips game still runs inside each player browser; the bridge only owns small room metadata, player slot status, latest snapshots, tiny JSON state, and MCP routing.
 
-Use the room controls in the app header to create a room, copy a play link like `/rooms/abc123`, copy a watch link like `/watch/abc123`, export the room JSON, or import a room JSON file. Watch links open the same two-pane game layout with read-only spectator frames.
+Use the room controls in the app header to create a room, click the room id to copy a play link like `/rooms/abc123`, copy a watch link like `/watch/abc123`, export the room JSON, or import a room JSON file. Watch links open the same two-pane game layout with read-only spectator frames, and clicking Watch from an active player tab releases that player slot.
 
 When both player panes allow human input, room play links assign one active browser session to each player slot. The room creator reserves Player 1 on the left, and the next player gets Player 2 on the right. Each human can use controls and game input only on their assigned side; the other side is shown as watch-only.
 

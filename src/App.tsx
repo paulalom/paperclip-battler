@@ -2,7 +2,6 @@ import {
   Bot,
   BrainCircuit,
   Check,
-  Copy,
   Download,
   Eye,
   ExternalLink,
@@ -748,18 +747,7 @@ export function App() {
     }
 
     const leaveParticipant = () => {
-      const body = JSON.stringify({ sessionId: roomSessionIdRef.current });
-      const url = `${trimmedBridgeUrl}/rooms/${encodeURIComponent(roomId)}/participants/leave`;
-      if (navigator.sendBeacon) {
-        navigator.sendBeacon(url, new Blob([body], { type: "application/json" }));
-        return;
-      }
-      void fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body,
-        keepalive: true
-      }).catch(() => undefined);
+      sendRoomParticipantLeave(roomId, true).catch(() => undefined);
     };
 
     postParticipant("participants").catch(() => {
@@ -904,6 +892,30 @@ export function App() {
     }
   }
 
+  async function sendRoomParticipantLeave(targetRoomId: string, preferBeacon = false) {
+    const body = JSON.stringify({ sessionId: roomSessionIdRef.current });
+    const url = `${trimmedBridgeUrl}/rooms/${encodeURIComponent(targetRoomId)}/participants/leave`;
+    if (preferBeacon && navigator.sendBeacon) {
+      navigator.sendBeacon(url, new Blob([body], { type: "application/json" }));
+      return;
+    }
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+      keepalive: true
+    });
+    if (!response.ok) throw new Error(`Bridge returned ${response.status}`);
+  }
+
+  function watchRoom() {
+    const targetRoomId = roomId;
+    setRoomParticipant(null);
+    void sendRoomParticipantLeave(targetRoomId).catch(() => setStatus("offline"));
+    navigateRoom(targetRoomId, "watch");
+  }
+
   async function createRoom() {
     try {
       const response = await fetch(`${trimmedBridgeUrl}/rooms`, {
@@ -1003,21 +1015,18 @@ export function App() {
               </button>
               <button
                 className={`room-chip ${roomView === "play" ? "active" : ""}`}
-                onClick={() => navigateRoom(roomId, "play")}
-                title={playUrl}
+                onClick={() => copyRoomUrl("play")}
+                title={`Copy play link: ${playUrl}`}
               >
                 <Link size={14} />
                 <span>{roomId}</span>
               </button>
               <button
                 className={`icon-button ${roomView === "watch" ? "active" : ""}`}
-                onClick={() => navigateRoom(roomId, "watch")}
-                title={watchUrl}
+                onClick={watchRoom}
+                title="Watch room and release player slot"
               >
                 <Eye size={16} />
-              </button>
-              <button className="icon-button" onClick={() => copyRoomUrl("play")} title="Copy play link">
-                <Copy size={16} />
               </button>
               <button className="icon-button" onClick={() => copyRoomUrl("watch")} title="Copy watch link">
                 <Eye size={16} />
