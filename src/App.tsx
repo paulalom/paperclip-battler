@@ -404,9 +404,8 @@ export function App() {
   const trimmedBridgeUrl = useMemo(() => bridgeUrl.replace(/\/+$/, ""), [bridgeUrl]);
   const playUrl = `${window.location.origin}/rooms/${encodeURIComponent(roomId)}`;
   const watchUrl = `${window.location.origin}/watch/${encodeURIComponent(roomId)}`;
-  const bothHumanControlled = PLAYER_IDS.every((playerId) => playerModeAllowsHumanInput(playerModes[playerId]));
   const reservesRoomSlot = roomSlotsEnabled && roomView === "play" && !useDefaultLobby;
-  const usesRoomSlots = reservesRoomSlot && (embedded || bothHumanControlled);
+  const usesRoomSlots = reservesRoomSlot;
   const gameStartedAt = health?.room?.gameStartedAt ?? health?.gameStartedAt ?? null;
   const elapsedGameMs = gameStartedAt ? timerNow - gameStartedAt : health?.room?.elapsedGameMs ?? health?.elapsedGameMs ?? 0;
   const elapsedGameTime = formatElapsedGameTime(elapsedGameMs);
@@ -1028,9 +1027,6 @@ export function App() {
               >
                 <Eye size={16} />
               </button>
-              <button className="icon-button" onClick={() => copyRoomUrl("watch")} title="Copy watch link">
-                <Eye size={16} />
-              </button>
               <button className="icon-button" onClick={exportRoom} title="Export room">
                 <Download size={16} />
               </button>
@@ -1548,10 +1544,6 @@ function readPlayerModes(): Record<PlayerId, PlayerMode> {
 
 function isPlayerMode(value: unknown): value is PlayerMode {
   return value === "human" || value === "agent" || value === "heuristic" || value === "both";
-}
-
-function playerModeAllowsHumanInput(mode: PlayerMode) {
-  return mode === "human" || mode === "both";
 }
 
 function modeLabel(mode: PlayerMode) {
