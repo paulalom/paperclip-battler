@@ -1584,10 +1584,38 @@ function createSpectatorControllerScript(roomId: string, playerId: PlayerId) {
   ];
 
   let lastSaveSignature = "";
+  let lastStructuralSignature = "";
   let syncInFlight = false;
   let syncAgainAfterInFlight = false;
   let syncTimer = null;
   let eventStream = null;
+
+  const STRUCTURAL_SAVE_GAME_KEYS = [
+    "resetFlag",
+    "dismantle",
+    "testFlag",
+    "milestoneFlag",
+    "compFlag",
+    "creativityOn",
+    "projectsFlag",
+    "autoClipperFlag",
+    "megaClipperFlag",
+    "wireBuyerFlag",
+    "humanFlag",
+    "trustFlag",
+    "creationFlag",
+    "wireProductionFlag",
+    "spaceFlag",
+    "factoryFlag",
+    "harvesterFlag",
+    "wireDroneFlag",
+    "qFlag",
+    "investmentEngineFlag",
+    "strategyEngineFlag",
+    "autoTourneyFlag",
+    "battleFlag",
+    "swarmFlag"
+  ];
 
   const normalizeRecord = (value) => {
     if (!value || typeof value !== "object" || Array.isArray(value)) return {};
@@ -1604,6 +1632,31 @@ function createSpectatorControllerScript(roomId: string, playerId: PlayerId) {
 
   const saveSignature = (save) => JSON.stringify(save);
 
+  const parseJson = (value, fallback = null) => {
+    try {
+      return typeof value === "string" && value ? JSON.parse(value) : fallback;
+    } catch {
+      return fallback;
+    }
+  };
+
+  const structuralSignature = (save) => {
+    const savedGame = parseJson(save?.localStorage?.saveGame, {});
+    const game = {};
+    for (const key of STRUCTURAL_SAVE_GAME_KEYS) {
+      game[key] = savedGame?.[key];
+    }
+
+    return JSON.stringify({
+      game,
+      savePrestige: save?.localStorage?.savePrestige ?? null,
+      saveProjectsUses: save?.localStorage?.saveProjectsUses ?? null,
+      saveProjectsFlags: save?.localStorage?.saveProjectsFlags ?? null,
+      saveProjectsActive: save?.localStorage?.saveProjectsActive ?? null,
+      saveStratsActive: save?.localStorage?.saveStratsActive ?? null
+    });
+  };
+
   const importStorage = (storage, values) => {
     storage.clear();
     for (const [key, value] of Object.entries(values || {})) {
@@ -1617,6 +1670,7 @@ function createSpectatorControllerScript(roomId: string, playerId: PlayerId) {
     importStorage(window.localStorage, save.localStorage);
     importStorage(window.sessionStorage, save.sessionStorage);
     lastSaveSignature = saveSignature(save);
+    lastStructuralSignature = structuralSignature(save);
     return true;
   };
 
@@ -1662,6 +1716,73 @@ function createSpectatorControllerScript(roomId: string, playerId: PlayerId) {
     setText("marketingLvl", saved.marketingLvl);
     setText("adCost", saved.adCost, 2);
     if (Number.isFinite(Number(saved.demand))) setText("demand", Number(saved.demand) * 10);
+  };
+
+  const readStorageJson = (key, fallback = null) => parseJson(window.localStorage.getItem(key), fallback);
+
+  const applySavedGameGlobals = () => {
+    const saved = readSavedGame();
+    if (!saved) return;
+
+    for (const [key, value] of Object.entries(saved)) {
+      try {
+        window[key] = value;
+      } catch {
+        // Some globals may be unavailable on older game revisions.
+      }
+    }
+  };
+
+  const applyProjectStateFromSave = (structuralChange) => {
+    const projects = Array.isArray(window.projects) ? window.projects : null;
+    if (projects) {
+      const projectUses = readStorageJson("saveProjectsUses", []);
+      const projectFlags = readStorageJson("saveProjectsFlags", []);
+      if (Array.isArray(projectUses) && Array.isArray(projectFlags)) {
+        for (let index = 0; index < projects.length; index += 1) {
+          if (!projects[index]) continue;
+          projects[index].uses = projectUses[index];
+          projects[index].flag = projectFlags[index];
+        }
+      }
+
+      const activeProjectIds = readStorageJson("saveProjectsActive", []);
+      const projectList = document.getElementById("projectListTop");
+      if (structuralChange && Array.isArray(activeProjectIds) && projectList && typeof window.displayProjects === "function") {
+        projectList.textContent = "";
+        window.activeProjects = [];
+        for (const project of projects) {
+          if (!project?.id || !activeProjectIds.includes(project.id)) continue;
+          window.displayProjects(project);
+          window.activeProjects.push(project);
+        }
+      }
+    }
+
+    const strats = Array.isArray(window.allStrats) ? window.allStrats : null;
+    const stratFlags = readStorageJson("saveStratsActive", []);
+    if (strats && Array.isArray(stratFlags)) {
+      for (let index = 0; index < strats.length; index += 1) {
+        if (strats[index]) strats[index].active = stratFlags[index];
+      }
+    }
+  };
+
+  const runGameRefresh = () => {
+    for (const fn of ["refresh", "updateStats", "buttonUpdate"]) {
+      try {
+        if (typeof window[fn] === "function") window[fn]();
+      } catch {
+        // Fall back to direct visible-stat patching below.
+      }
+    }
+  };
+
+  const syncGameFromSave = (structuralChange = false) => {
+    applySavedGameGlobals();
+    applyProjectStateFromSave(structuralChange);
+    runGameRefresh();
+    syncVisibleStatsFromSave();
   };
 
   const blockTrustedInput = (event) => {
@@ -1831,11 +1952,14 @@ function createSpectatorControllerScript(roomId: string, playerId: PlayerId) {
       if (!save) return;
       const signature = saveSignature(save);
       if (signature === lastSaveSignature) {
-        syncVisibleStatsFromSave();
+        syncGameFromSave(false);
         return;
       }
+      const previousStructuralSignature = lastStructuralSignature;
+      const nextStructuralSignature = structuralSignature(save);
+      const structuralChange = Boolean(previousStructuralSignature && previousStructuralSignature !== nextStructuralSignature);
       applySave(save);
-      window.location.reload();
+      syncGameFromSave(structuralChange);
     } catch {
       // The bridge may be restarting.
     } finally {
@@ -1890,7 +2014,7 @@ function createSpectatorControllerScript(roomId: string, playerId: PlayerId) {
 
   const start = () => {
     installInputGuards();
-    syncVisibleStatsFromSave();
+    syncGameFromSave(false);
     syncSave();
     startSaveEventStream();
     window.setInterval(() => scheduleSyncSave(0), ${SPECTATOR_SAVE_SYNC_INTERVAL_MS});
